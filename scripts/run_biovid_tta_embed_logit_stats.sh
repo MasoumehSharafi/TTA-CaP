@@ -24,4 +24,9 @@ python online_tta_runner_embed_logit_stats_pass_rate.py \
   --fusion-space embed \
   --gates "temp,entropy,proto" \
   --save-metrics-txt "$OUT_TXT" \
-  --save-metrics "$OUT_JSON"
+  --save-metrics "$OUT_JSON" \
+  --temporal \
+  --clip-len 8 \
+  --temporal-layers 4 \
+  --temporal-heads 8 \
+  --temporal-ff 2048

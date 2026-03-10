@@ -14,3 +14,9 @@ ftfy
 regex
 wilds==1.2.2
 tabulate
+numpy
+PyYAML
+Pillow
+einops
+torch
+torchvision

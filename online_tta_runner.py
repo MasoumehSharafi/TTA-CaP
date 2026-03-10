@@ -33,6 +33,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 import clip
+from models.vclip import VClip
 from utils import (
     build_test_data_loader,
     clip_classifier,
@@ -352,6 +353,13 @@ def get_arguments():
     p.add_argument("--window", type=int, default=3)
     p.add_argument("--proto-topk", type=int, default=5)
     p.add_argument("--cache-topk", type=int, default=5)
+    p.add_argument("--temporal", action="store_true", help="Use temporal transformer after CLIP image encoder.")
+    p.add_argument("--clip-len", type=int, default=8, help="Temporal window length for BioVid.")
+    p.add_argument("--temporal-layers", type=int, default=4, help="Number of temporal transformer layers.")
+    p.add_argument("--temporal-heads", type=int, default=8, help="Number of temporal attention heads.")
+    p.add_argument("--temporal-ff", type=int, default=2048, help="Temporal transformer FFN hidden dimension.")
+    p.add_argument("--temporal-max-len", type=int, default=256, help="Maximum temporal length supported.")
+    p.add_argument("--temporal-dropout", type=float, default=0.0, help="Temporal transformer dropout.")
 
     p.add_argument(
         "--gates",
@@ -758,17 +766,34 @@ def main():
     device_str = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(device_str)
 
-    clip_model, preprocess = clip.load(args.backbone, device=device_str)
+    base_clip_model, preprocess = clip.load(args.backbone, device=device_str)
 
     if args.ft_clip_path:
         ckpt = torch.load(args.ft_clip_path, map_location="cpu")
         state = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
-        missing, unexpected = clip_model.load_state_dict(state, strict=False)
+        missing, unexpected = base_clip_model.load_state_dict(state, strict=False)
         print(f"[FT-CLIP] Loaded: {args.ft_clip_path}")
         if len(missing) > 0:
             print(f"[FT-CLIP] Missing keys: {len(missing)}")
         if len(unexpected) > 0:
             print(f"[FT-CLIP] Unexpected keys: {len(unexpected)}")
+
+    if args.temporal:
+        if args.backbone != "ViT-B/32":
+            print("[Warning] Current temporal wrapper assumes d_model=512. ViT-B/32 is safest.")
+
+        clip_model = VClip(
+            backbone=base_clip_model,
+            d_model=512,
+            nhead=args.temporal_heads,
+            num_layers=args.temporal_layers,
+            dim_forward=args.temporal_ff,
+            max_len=args.temporal_max_len,
+            dropout=args.temporal_dropout,
+            freeze_backbone=True,
+        ).to(device)
+    else:
+        clip_model = base_clip_model
 
     clip_model.eval()
 
@@ -810,7 +835,13 @@ def main():
         cfg = get_config_file(args.config, dataset_name)
         print("\nRunning dataset configurations:\n", cfg, "\n")
 
-        test_loader, classnames, template = build_test_data_loader(dataset_name, args.data_root, preprocess)
+        test_loader, classnames, template = build_test_data_loader(
+            dataset_name,
+            args.data_root,
+            preprocess,
+            temporal=args.temporal,
+            clip_len=args.clip_len,
+        )
         clip_weights = clip_classifier(classnames, template, clip_model)
 
         tri = cfg.get("tri_gate", {})

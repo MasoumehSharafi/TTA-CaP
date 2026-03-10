@@ -5,6 +5,7 @@ import math
 import numpy as np
 import clip
 from pathlib import Path
+from collections import defaultdict
 
 from datasets.imagenet import ImageNet
 from datasets import build_dataset
@@ -19,63 +20,147 @@ except ImportError:
     BICUBIC = Image.BICUBIC
 
 
-# -------------------------
-# NEW: BioVid wrapper that returns meta
-# -------------------------
-
 class BioVidTestWithMeta(torch.utils.data.Dataset):
     """
-    Wraps a Datum-style dataset list (dataset.test) and returns:
-      (img_tensor, target_tensor, meta_dict)
+    Wraps a frame-level Datum dataset and returns either:
+      - single image tensor [C,H,W]              when temporal=False
+      - temporal clip tensor [T,C,H,W]           when temporal=True
 
-    meta_dict contains:
-      - subject_id: int (from Datum.domain)
-      - video_id: str (folder name right after neutral/pain)
-      - impath: str
+    meta contains:
+      - subject_id
+      - video_id
+      - impath
+      - frame_idx_in_video
+      - clip_len
     """
-    def __init__(self, data_source, tfm=None):
+
+    def __init__(self, data_source, tfm=None, temporal=False, clip_len=8):
         self.data_source = data_source
         self.tfm = tfm
+        self.temporal = temporal
+        self.clip_len = int(clip_len)
         self._to_tensor = transforms.ToTensor()
+
+        # build frame groups by video so each frame can retrieve neighboring frames
+        self.video_to_indices = defaultdict(list)
+        self.video_to_paths = defaultdict(list)
+
+        for idx, item in enumerate(self.data_source):
+            impath = item.impath
+            subject_id, video_id = self._parse_subject_and_video(impath)
+            key = (str(subject_id), str(video_id))
+            self.video_to_indices[key].append(idx)
+            self.video_to_paths[key].append(impath)
+
+        # sort paths within each video
+        for key in self.video_to_paths:
+            pairs = sorted(
+                zip(self.video_to_paths[key], self.video_to_indices[key]),
+                key=lambda x: x[0]
+            )
+            self.video_to_paths[key] = [p for p, _ in pairs]
+            self.video_to_indices[key] = [i for _, i in pairs]
+
+        # map global dataset idx -> position inside its video
+        self.idx_to_video_info = {}
+        for key in self.video_to_indices:
+            for pos, idx in enumerate(self.video_to_indices[key]):
+                self.idx_to_video_info[idx] = {
+                    "video_key": key,
+                    "pos_in_video": pos,
+                }
 
     def __len__(self):
         return len(self.data_source)
 
-    def __getitem__(self, idx):
-        item = self.data_source[idx]  # Datum with .impath, .label, .domain, .classname
+    @staticmethod
+    def _parse_subject_and_video(impath):
+        p = Path(impath)
+        parts = p.parts
 
-        impath = item.impath
+        subject_id = "global"
+        video_id = "unknown"
+
+        for cname in ["neutral", "pain"]:
+            if cname in parts:
+                i = parts.index(cname)
+                if i - 1 >= 0:
+                    subject_id = parts[i - 1]
+                if i + 1 < len(parts):
+                    video_id = parts[i + 1]
+                break
+
+        return subject_id, video_id
+
+    def _load_one_image(self, impath):
         img = Image.open(impath).convert("RGB")
-
         if self.tfm is not None:
             img = self.tfm(img)
         else:
             img = self._to_tensor(img)
+        return img
 
-        # Parse video_id from path: .../<subject>/<class>/<video_folder>/.../frame.jpg
-        p = Path(impath)
-        parts = p.parts
-        video_id = "unknown"
-        for cname in ["neutral", "pain"]:
-            if cname in parts:
-                i = parts.index(cname)
-                if i + 1 < len(parts):
-                    video_id = parts[i + 1]
-                break
+    def _sample_clip_paths(self, video_paths, center_pos):
+        """
+        Centered temporal window with edge replication.
+        """
+        if self.clip_len <= 1:
+            return [video_paths[center_pos]]
+
+        half = self.clip_len // 2
+        if self.clip_len % 2 == 0:
+            offsets = list(range(-half, half))
+        else:
+            offsets = list(range(-half, half + 1))
+
+        clip_paths = []
+        n = len(video_paths)
+        for off in offsets:
+            j = center_pos + off
+            j = max(0, min(n - 1, j))
+            clip_paths.append(video_paths[j])
+
+        if len(clip_paths) != self.clip_len:
+            while len(clip_paths) < self.clip_len:
+                clip_paths.append(clip_paths[-1])
+            clip_paths = clip_paths[:self.clip_len]
+
+        return clip_paths
+
+    def __getitem__(self, idx):
+        item = self.data_source[idx]
+        impath = item.impath
+
+        subject_id, video_id = self._parse_subject_and_video(impath)
+        video_key = (str(subject_id), str(video_id))
+
+        target = torch.tensor(item.label, dtype=torch.long)
+
+        if not self.temporal:
+            img = self._load_one_image(impath)
+            meta = {
+                "subject_id": int(item.domain) if item.domain is not None else "global",
+                "video_id": video_id,
+                "impath": impath,
+                "frame_idx_in_video": self.idx_to_video_info[idx]["pos_in_video"],
+                "clip_len": 1,
+            }
+            return img, target, meta
+
+        pos_in_video = self.idx_to_video_info[idx]["pos_in_video"]
+        video_paths = self.video_to_paths[video_key]
+        clip_paths = self._sample_clip_paths(video_paths, pos_in_video)
+        clip = torch.stack([self._load_one_image(p) for p in clip_paths], dim=0)   # [T,C,H,W]
 
         meta = {
             "subject_id": int(item.domain) if item.domain is not None else "global",
             "video_id": video_id,
             "impath": impath,
+            "frame_idx_in_video": pos_in_video,
+            "clip_len": self.clip_len,
         }
+        return clip, target, meta
 
-        target = torch.tensor(item.label, dtype=torch.long)
-        return img, target, meta
-
-
-# -------------------------
-# Existing utilities
-# -------------------------
 
 def get_entropy(loss, clip_weights):
     max_entropy = math.log2(clip_weights.size(1))
@@ -130,15 +215,15 @@ def get_clip_logits(images, clip_model, clip_weights, head=None):
 
         image_features = clip_model.encode_image(images)
         image_features /= image_features.norm(dim=-1, keepdim=True)
+
         if head is not None:
-            # Use learned head instead of zero-shot text weights
             clip_logits = head(image_features.float())
         else:
-            clip_logits = 100. * image_features @ clip_weights
+            clip_logits = 100.0 * image_features @ clip_weights
 
         if image_features.size(0) > 1:
             batch_entropy = softmax_entropy(clip_logits)
-            selected_idx = torch.argsort(batch_entropy, descending=False)[:int(batch_entropy.size()[0] * 0.1)]
+            selected_idx = torch.argsort(batch_entropy, descending=False)[:max(1, int(batch_entropy.size(0) * 0.1))]
             output = clip_logits[selected_idx]
             image_features = image_features[selected_idx].mean(0).unsqueeze(0)
             clip_logits = output.mean(0).unsqueeze(0)
@@ -190,11 +275,9 @@ def get_config_file(config_path, dataset_name):
     return cfg
 
 
-def build_test_data_loader(dataset_name, root_path, preprocess):
+def build_test_data_loader(dataset_name, root_path, preprocess, temporal=False, clip_len=8):
     if dataset_name == 'I':
         dataset = ImageNet(root_path, preprocess)
-        # For online/streaming TTA, shuffle=False is usually better,
-        # but I keep your original behavior here.
         test_loader = torch.utils.data.DataLoader(dataset.test, batch_size=1, num_workers=8, shuffle=True)
 
     elif dataset_name in ['A', 'V', 'R', 'S']:
@@ -210,14 +293,18 @@ def build_test_data_loader(dataset_name, root_path, preprocess):
     elif dataset_name in ["biovid"]:
         dataset = build_dataset("biovid", root_path)
 
-        # IMPORTANT: For your online_tta_runner.py we need meta (subject_id, video_id).
-        wrapped = BioVidTestWithMeta(dataset.test, tfm=preprocess)
+        wrapped = BioVidTestWithMeta(
+            dataset.test,
+            tfm=preprocess,
+            temporal=temporal,
+            clip_len=clip_len,
+        )
 
         test_loader = torch.utils.data.DataLoader(
             wrapped,
             batch_size=1,
             num_workers=8,
-            shuffle=False,   # streaming order matters
+            shuffle=False,
             pin_memory=True,
         )
 
