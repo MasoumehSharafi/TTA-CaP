@@ -21,6 +21,16 @@ Eric Granger<sup>1</sup>**
 ## Abstract
 Facial expression recognition (FER) in videos requires model personalization to capture the considerable variations across subjects. Vision-language models (VLMs) offer strong transfer to downstream tasks through image-text alignment, but their performance can still degrade under inter-subject distribution shifts. Personalizing models using test-time adaptation (TTA) methods can mitigate this challenge. However, most state-of-the-art TTA methods rely on unsupervised parameter optimization, introducing computational overhead that is impractical in many real-world applications. This paper introduces TTA through Cache Personalization (TTA-CaP), a cache-based TTA method that enables cost-effective (gradient-free) personalization of VLMs for video FER. Prior cache-based TTA methods rely solely on dynamic memories that store test samples, which can accumulate errors and drift due to noisy pseudo-labels. TTA-CaP leverages three coordinated caches -- a personalized source cache that stores source-domain prototypes, a positive target cache that accumulates reliable subject-specific samples, and a negative target cache that stores low-confidence cases as negative samples to reduce the impact of noisy pseudo-labels. Cache updates and replacement are controlled by a tri-gate mechanism based on temporal stability, confidence, and consistency with the personalized cache. Finally, TTA-CaP refines predictions through fusion of embeddings, yielding refined representations that support temporally stable video-level predictions. Our experiments on three challenging video FER datasets — BioVid, StressID, and BAH — indicate that TTA-Cap can outperform state-of-the-art TTA methods under subject-specific and environmental shifts, while maintaining low computational and memory overhead for real-world deployment.
 
+## Main Contributions
+
+Our main contributions are:
+
+- A cache-based, gradient-free TTA method, \ours, that couples target caches with a personalized source cache built from source subject prototypes to mitigate noisy pseudo-label updates and improve personalized video FER.
+
+- A tri-gate cache update mechanism together with an embedding-level fusion strategy that combines CLIP visual features with cache-retrieved representations for more reliable predictions during TTA.
+
+- Extensive evaluation on three challenging video FER benchmarks—BioVid (pain estimation), StressID (stress recognition), and BAH (ambivalence-hesitancy recognition)—showing that \ours outperforms state-of-the-art prompt-tuning and cache-based baselines.
+
 ## Installation
 
 Clone the repository:
