@@ -36,7 +36,7 @@ Aff-Wild2: https://sites.google.com/view/dimitrioskollias/databases/aff-wild2
 ```sh
 bash run_build_protos.sh
 ```
-## Test
+## Online TTA
 ```sh
 bash ./scripts/biovid_run_online_tta.sh
 ```
