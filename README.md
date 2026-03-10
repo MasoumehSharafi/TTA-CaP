@@ -29,7 +29,7 @@ Our main contributions are:
 
 - A tri-gate cache update mechanism together with an embedding-level fusion strategy that combines CLIP visual features with cache-retrieved representations for more reliable predictions during TTA.
 
-- Extensive evaluation on three challenging video FER benchmarks—BioVid (pain estimation), StressID (stress recognition), and BAH (ambivalence-hesitancy recognition)—showing that \ours outperforms state-of-the-art prompt-tuning and cache-based baselines.
+- Extensive evaluation on three challenging video FER benchmarks—BioVid (pain estimation), StressID (stress recognition), and BAH (ambivalence-hesitancy recognition)—showing that TTA-CaP outperforms state-of-the-art prompt-tuning and cache-based baselines.
 
 ## Installation
 
