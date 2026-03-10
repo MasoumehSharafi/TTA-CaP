@@ -1,4 +1,4 @@
-# [Test-Time Adaptation via Cache Personalization for Facial Expression Recognition in Videos (ECCV2026)].
+# Test-Time Adaptation via Cache Personalization for Facial Expression Recognition in Videos (ECCV2026).
 
 by
 **Masoumeh Sharafi<sup>1</sup>,
