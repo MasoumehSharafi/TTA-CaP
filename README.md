@@ -1,6 +1,17 @@
 # Test-Time Adaptation via Cache Personalization for Facial Expression Recognition in Videos (ECCV2026).
 
+by
+**Masoumeh Sharafi<sup>1</sup>,
+Muhammad Osama Zeeshan<sup>1</sup>,
+Soufiane Belharbi<sup>1</sup>,
+Alessandro Lameiras Koerich<sup>2</sup>,
+Marco Pedersoli<sup>1</sup>,
+Eric Granger<sup>1</sup>**
 
+<sup>1</sup> LIVIA, Dept. of Systems Engineering, ÉTS, Montreal, Canada
+<br/>
+<sup>2</sup> LIVIA, Dept. of Software and IT Engineering, ÉTS, Montreal, Canada
+<br/>
 
 <p align="center"><img src="assets/Motivation_ECCV.png" alt="motivation" width="600">
 <p align="center"><img src="assets/Main_ECCV.png" alt="main" width="600">
