@@ -13,8 +13,8 @@ Eric Granger<sup>1</sup>**
 <sup>2</sup> LIVIA, Dept. of Software and IT Engineering, ÉTS, Montreal, Canada
 <br/>
 
-<p align="center"><img src="assets/Motivation_ECCV.png" alt="motivation" width="600">
-<p align="center"><img src="assets/Main_ECCV.png" alt="main" width="600">
+<p align="center"><img src="assets/Motivation.png" alt="motivation" width="600">
+<p align="center"><img src="assets/Main.png" alt="main" width="600">
 
 
 ## Abstract
