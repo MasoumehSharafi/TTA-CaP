@@ -35,7 +35,8 @@ Our main contributions are:
 @article{sharafi2026test,
   title={Test-Time Adaptation via Cache Personalization for Facial Expression Recognition in Videos},
   author={Sharafi, Masoumeh and Zeeshan, Muhammad Osama and Belharbi, Soufiane and Koerich, Alessandro Lameiras and Pedersoli, Marco and Granger, Eric},
-  journal={arXiv preprint arXiv:2603.21309},
+  journal={CoRR},
+  volume={abs/2603.21309},
   year={2026}
 }
 
