@@ -30,6 +30,26 @@ Our main contributions are:
 
 - Extensive evaluation on three challenging video FER benchmarks—BioVid (pain estimation), StressID (stress recognition), and BAH (ambivalence-hesitancy recognition)—showing that TTA-CaP outperforms state-of-the-art prompt-tuning and cache-based baselines.
 
+## Citation:
+```sh
+@article{sharafi2026test,
+  title={Test-Time Adaptation via Cache Personalization for Facial Expression Recognition in Videos},
+  author={Sharafi, Masoumeh and Zeeshan, Muhammad Osama and Belharbi, Soufiane and Koerich, Alessandro Lameiras and Pedersoli, Marco and Granger, Eric},
+  journal={arXiv preprint arXiv:2603.21309},
+  year={2026}
+}
+```
+
+```sh
+@article{gonzalez-26-ah-digital,
+  title={Ambivalence/Hesitancy Recognition in Videos for Personalized Digital Health Interventions},
+  author={González-González, M. and  Belharbi, S. and Zeeshan, M.O. and Sharafi, M. and Aslam, M.H. and Sia, L. and Richet, N. and Pedersoli, M. and Koerich, A.L. and Bacon, S.L. and Granger, E.},
+  journal={CoRR},
+  volume={abs/2604.11730},
+  year={2026}
+}
+```
+
 ## Installation
 
 Clone the repository:
