@@ -1,32 +1,13 @@
-"""
-Online TTA runner (BioVid-friendly) aligned with the paper text.
-
-Aligned behavior:
-- At each time t, extract the current target embedding z_t
-- Predict with CLIP using fused embedding
-- Query:
-    - fixed personalized source prototypes
-    - positive target cache
-    - negative target cache
-- Fuse in embedding space:
-    z_fuse = z_t + z_src + z_pos - z_neg
-- Tri-gate cache update:
-    - temporal gate: current predicted label must match majority over last W predictions
-    - entropy gate: use current-frame entropy
-    - prototype gate: prototype match must agree with current prediction and margin > tau_delta
-- Video prediction: average final frame logits over time
-"""
-
 from __future__ import annotations
 
 import argparse
+import json
 import random
+import time
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
-from typing import Deque, Dict, Hashable, Iterable, List, Optional, Tuple
-
-import json
-import time
+from pathlib import Path
+from typing import Deque, Dict, Hashable, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -39,752 +20,703 @@ from utils import (
     clip_classifier,
     get_clip_logits,
     get_config_file,
+    load_clip_backbone_checkpoint,
+    load_vclip_checkpoint,
+    natural_key,
 )
 
 
-# Small utilities
-
-def _to_device(x: torch.Tensor, device: torch.device) -> torch.Tensor:
-    return x.to(device, non_blocking=True)
+def l2_normalize(x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    return x / x.norm(dim=-1, keepdim=True).clamp_min(eps)
 
 
-def _l2_normalize(x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
-    return x / (x.norm(dim=-1, keepdim=True) + eps)
+def unwrap(value):
+    if torch.is_tensor(value):
+        return value.item() if value.numel() == 1 else value
+    if isinstance(value, (list, tuple)) and len(value) == 1:
+        return unwrap(value[0])
+    return value
 
 
-def _majority(labels: List[int]) -> int:
-    cnt = Counter(labels)
-    best = max(cnt.values())
-    tied = {k for k, v in cnt.items() if v == best}
-    if len(tied) == 1:
-        return next(iter(tied))
-    for y in reversed(labels):
-        if y in tied:
-            return y
+def as_key(value) -> str:
+    value = unwrap(value)
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode("utf-8", errors="ignore")
+    return str(value)
+
+
+def majority_label(labels: Sequence[int]) -> int:
+    if not labels:
+        raise ValueError("Cannot compute a majority label from an empty sequence.")
+    counts = Counter(labels)
+    maximum = max(counts.values())
+    tied = {label for label, count in counts.items() if count == maximum}
+    for label in reversed(labels):
+        if label in tied:
+            return label
     return labels[-1]
 
 
-def _unwrap(v):
-    if torch.is_tensor(v):
-        if v.numel() == 1:
-            return v.item()
-        return v
-    if isinstance(v, list) and len(v) == 1:
-        return v[0]
-    return v
+def compute_metrics(y_true: Sequence[int], y_pred: Sequence[int], num_classes: int) -> Dict[str, float]:
+    if len(y_true) != len(y_pred):
+        raise ValueError("y_true and y_pred must have equal length.")
+    if not y_true:
+        return {"WAR": 0.0, "F1_macro": 0.0}
 
+    confusion = torch.zeros((num_classes, num_classes), dtype=torch.long)
+    for target, prediction in zip(y_true, y_pred):
+        if 0 <= target < num_classes and 0 <= prediction < num_classes:
+            confusion[target, prediction] += 1
 
-def _as_subject_key(x) -> Hashable:
-    x = _unwrap(x)
-    if isinstance(x, (bytes, bytearray)):
-        x = x.decode("utf-8", errors="ignore")
-    if isinstance(x, (int, float)) and not isinstance(x, bool):
-        if int(x) == x:
-            return str(int(x))
-        return str(x)
-    return x
+    total = int(confusion.sum().item())
+    war = 100.0 * float(confusion.diag().sum().item()) / max(1, total)
+    support = confusion.sum(dim=1).float()
+    predicted = confusion.sum(dim=0).float()
+    true_positive = confusion.diag().float()
+    precision = true_positive / predicted.clamp_min(1.0)
+    recall = true_positive / support.clamp_min(1.0)
+    f1 = 2.0 * precision * recall / (precision + recall).clamp_min(1e-12)
+    return {"WAR": war, "F1_macro": 100.0 * float(f1.mean().item())}
 
-
-@torch.no_grad()
-def compute_metrics_from_lists(y_true: List[int], y_pred: List[int], num_classes: int) -> Dict[str, float]:
-    C = num_classes
-    if len(y_true) == 0:
-        return {"WAR": 0.0, "UAR": 0.0, "F1_macro": 0.0}
-
-    cm = torch.zeros((C, C), dtype=torch.long)
-    for t, p in zip(y_true, y_pred):
-        if 0 <= t < C and 0 <= p < C:
-            cm[t, p] += 1
-
-    total = cm.sum().item()
-    correct = cm.diag().sum().item()
-    war = 100.0 * (correct / max(1, total))
-
-    support = cm.sum(dim=1).float()
-    pred_count = cm.sum(dim=0).float()
-
-    recall = cm.diag().float() / torch.clamp(support, min=1.0)
-    precision = cm.diag().float() / torch.clamp(pred_count, min=1.0)
-
-    uar = 100.0 * recall.mean().item()
-    f1 = 2 * precision * recall / torch.clamp(precision + recall, min=1e-12)
-    f1_macro = 100.0 * f1.mean().item()
-
-    return {"WAR": war, "UAR": uar, "F1_macro": f1_macro}
-
-
-def entropy_from_probs(p: torch.Tensor) -> torch.Tensor:
-    eps = 1e-12
-    return -(p * (p + eps).log()).sum(dim=1)
-
-
-def count_params(model: torch.nn.Module) -> Tuple[int, int]:
-    total = sum(p.numel() for p in model.parameters())
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    return total, trainable
-
-
-@torch.no_grad()
-def estimate_gflops_clip_visual(clip_model, device: torch.device, input_res: int = 224) -> Optional[float]:
-    x = torch.randn(1, 3, input_res, input_res, device=device)
-
-    try:
-        from fvcore.nn import FlopCountAnalysis  # type: ignore
-        clip_model.eval()
-        flops = FlopCountAnalysis(clip_model.visual, x).total()
-        return float(flops) / 1e9
-    except Exception:
-        pass
-
-    try:
-        from thop import profile  # type: ignore
-        clip_model.eval()
-        macs, _params = profile(clip_model.visual, inputs=(x,), verbose=False)
-        flops = 2.0 * float(macs)
-        return flops / 1e9
-    except Exception:
-        return None
-    
-@dataclass
-class BufferItem:
-    pred: int
-
-
-class RingBuffer:
-    def __init__(self, W: int):
-        assert W >= 1
-        self.W = W
-        self.buf: Deque[BufferItem] = deque(maxlen=W)
-
-    def push(self, item: BufferItem) -> None:
-        self.buf.append(item)
-
-    def __len__(self) -> int:
-        return len(self.buf)
-
-    def maj_label(self) -> int:
-        labels = [b.pred for b in self.buf]
-        return _majority(labels)
 
 @dataclass
 class CacheEntry:
-    z: torch.Tensor      # [1, d] normalized
+    embedding: torch.Tensor
     entropy: float
-    y: torch.Tensor      # [1, C]
+    class_index: int
 
 
 class BoundedCache:
-    """Per-class bounded cache with entropy-based eviction (keep lowest entropy)."""
+    """Per-class fixed-capacity cache that retains the lowest-entropy entries."""
 
-    def __init__(self, num_classes: int, capacity_per_class: int, device: torch.device):
-        self.C = num_classes
-        self.cap = int(capacity_per_class)
+    def __init__(self, num_classes: int, capacity_per_class: int, device: torch.device) -> None:
+        self.num_classes = int(num_classes)
+        self.capacity = int(capacity_per_class)
         self.device = device
-        self.data: Dict[int, List[CacheEntry]] = {c: [] for c in range(self.C)}
+        self.data: Dict[int, List[CacheEntry]] = {c: [] for c in range(self.num_classes)}
 
     def __len__(self) -> int:
-        return sum(len(v) for v in self.data.values())
+        return sum(len(entries) for entries in self.data.values())
 
-    def add(self, z: torch.Tensor, cls: int, entropy: float) -> None:
-        if self.cap <= 0:
+    def add(self, embedding: torch.Tensor, class_index: int, entropy: float) -> None:
+        if self.capacity <= 0:
             return
-
-        z = _l2_normalize(z.detach())
-        z = _to_device(z, self.device)
-
-        y = F.one_hot(torch.tensor([cls], device=self.device), num_classes=self.C).float()
-
-        entry = CacheEntry(z=z, entropy=float(entropy), y=y)
-        bucket = self.data[int(cls)]
+        class_index = int(class_index)
+        if class_index not in self.data:
+            raise ValueError(f"Invalid cache class index: {class_index}")
+        entry = CacheEntry(
+            embedding=l2_normalize(embedding.detach().to(self.device).float()),
+            entropy=float(entropy),
+            class_index=class_index,
+        )
+        bucket = self.data[class_index]
         bucket.append(entry)
-
-        bucket.sort(key=lambda e: e.entropy)
-        if len(bucket) > self.cap:
-            del bucket[self.cap:]
+        bucket.sort(key=lambda item: item.entropy)
+        del bucket[self.capacity:]
 
     @torch.no_grad()
-    def aggregate_labels(self, q: torch.Tensor, beta: float, k: int) -> torch.Tensor:
-        if len(self) == 0:
-            return torch.zeros((1, self.C), device=self.device)
-
-        q = _l2_normalize(_to_device(q, self.device))
-        keys: List[torch.Tensor] = []
-        vals: List[torch.Tensor] = []
-        for c in range(self.C):
-            for e in self.data[c]:
-                keys.append(e.z)
-                vals.append(e.y)
-
-        K = torch.cat(keys, dim=0)
-        V = torch.cat(vals, dim=0)
-        sims = (q @ K.t()).squeeze(0)
-
-        kk = min(int(k), sims.numel())
-        topv, topi = torch.topk(sims, k=kk, largest=True)
-        w = torch.softmax(topv * float(beta), dim=0)
-        out = (w.unsqueeze(1) * V[topi]).sum(dim=0, keepdim=True)
-        return out
+    def retrieve_embedding(self, query: torch.Tensor, class_index: int, topk: int, beta: float) -> torch.Tensor:
+        query = l2_normalize(query.to(self.device).float())
+        bucket = self.data.get(int(class_index), [])
+        if not bucket:
+            return torch.zeros_like(query)
+        keys = torch.cat([entry.embedding for entry in bucket], dim=0)
+        similarities = (query @ keys.t()).squeeze(0)
+        count = min(max(1, int(topk)), similarities.numel())
+        values, indices = torch.topk(similarities, k=count, largest=True)
+        weights = torch.softmax(float(beta) * values, dim=0)
+        return l2_normalize((weights.unsqueeze(1) * keys[indices]).sum(dim=0, keepdim=True))
 
     @torch.no_grad()
-    def aggregate_embed(self, q: torch.Tensor, beta: float, k: int) -> torch.Tensor:
-        q = _l2_normalize(_to_device(q, self.device))
-        if len(self) == 0:
-            return torch.zeros_like(q)
-
-        keys: List[torch.Tensor] = []
-        for c in range(self.C):
-            for e in self.data[c]:
-                keys.append(e.z)
-
-        K = torch.cat(keys, dim=0)
-        sims = (q @ K.t()).squeeze(0)
-
-        kk = min(int(k), sims.numel())
-        topv, topi = torch.topk(sims, k=kk, largest=True)
-        w = torch.softmax(topv * float(beta), dim=0)
-
-        z = (w.unsqueeze(1) * K[topi]).sum(dim=0, keepdim=True)
-        z = _l2_normalize(z)
-        return z
+    def retrieve_label_scores(self, query: torch.Tensor, topk: int, beta: float) -> torch.Tensor:
+        query = l2_normalize(query.to(self.device).float())
+        entries = [entry for bucket in self.data.values() for entry in bucket]
+        if not entries:
+            return torch.zeros((1, self.num_classes), device=self.device)
+        keys = torch.cat([entry.embedding for entry in entries], dim=0)
+        labels = F.one_hot(
+            torch.tensor([entry.class_index for entry in entries], device=self.device),
+            num_classes=self.num_classes,
+        ).float()
+        similarities = (query @ keys.t()).squeeze(0)
+        count = min(max(1, int(topk)), similarities.numel())
+        values, indices = torch.topk(similarities, k=count, largest=True)
+        weights = torch.softmax(float(beta) * values, dim=0)
+        return (weights.unsqueeze(1) * labels[indices]).sum(dim=0, keepdim=True)
 
 
-# Personalized prototypes
+class PredictionHistory:
+    def __init__(self, length: int) -> None:
+        if length < 1:
+            raise ValueError("Temporal gate window must be >= 1.")
+        self.values: Deque[int] = deque(maxlen=int(length))
+
+    def append(self, prediction: int) -> None:
+        self.values.append(int(prediction))
+
+    def majority(self) -> int:
+        return majority_label(list(self.values))
+
 
 @torch.no_grad()
-def prototype_scores(q: torch.Tensor, proto_by_class: Dict[int, torch.Tensor], num_classes: int, topk: int, device):
-    q = _l2_normalize(_to_device(q, device)).float()
-    scores = torch.full((1, num_classes), -1e9, device=device, dtype=q.dtype)
-
-    for c in range(num_classes):
-        P = proto_by_class.get(c, None)
-        if P is None or (torch.is_tensor(P) and P.numel() == 0):
+def prototype_scores(
+    query: torch.Tensor,
+    prototypes: Dict[int, torch.Tensor],
+    num_classes: int,
+    topk: int,
+    device: torch.device,
+) -> torch.Tensor:
+    query = l2_normalize(query.to(device).float())
+    scores = torch.full((1, num_classes), -1e9, device=device)
+    for class_index in range(num_classes):
+        class_prototypes = prototypes.get(class_index)
+        if class_prototypes is None or class_prototypes.numel() == 0:
             continue
-        P = _to_device(P, device).float()
-        if P.dim() != 2:
-            raise ValueError(f"proto_by_class[{c}] must be [N_c, d], got {tuple(P.shape)}")
-        P = _l2_normalize(P)
-
-        sims = (q @ P.t()).squeeze(0)
-        kk = min(int(topk), sims.numel())
-        topv, _ = torch.topk(sims, k=kk, largest=True)
-        scores[0, c] = topv.mean()
+        class_prototypes = l2_normalize(class_prototypes.to(device).float())
+        similarities = (query @ class_prototypes.t()).squeeze(0)
+        count = min(max(1, int(topk)), similarities.numel())
+        scores[0, class_index] = torch.topk(similarities, k=count, largest=True).values.mean()
     return scores
 
 
 @torch.no_grad()
-def prototype_embed(
-    q: torch.Tensor,
-    proto_by_class: Dict[int, torch.Tensor],
-    num_classes: int,
+def retrieve_source_embedding(
+    query: torch.Tensor,
+    prototypes: Dict[int, torch.Tensor],
+    predicted_class: int,
     topk: int,
-    device,
-    gamma: float = 10.0,
-):
-    q = _l2_normalize(_to_device(q, device)).float()
-
-    centroids: List[Optional[torch.Tensor]] = [None] * num_classes
-    valid = torch.zeros((num_classes,), device=device, dtype=torch.bool)
-
-    for c in range(num_classes):
-        P = proto_by_class.get(c, None)
-        if P is None or (torch.is_tensor(P) and P.numel() == 0):
-            continue
-        P = _to_device(P, device).float()
-        P = _l2_normalize(P)
-        mu = _l2_normalize(P.mean(dim=0, keepdim=True))
-        centroids[c] = mu
-        valid[c] = True
-
-    s = prototype_scores(q, proto_by_class, num_classes, topk=topk, device=device)
-    a = torch.softmax(s * float(gamma), dim=1)
-
-    z_src = torch.zeros_like(q)
-    for c in range(num_classes):
-        if valid[c]:
-            z_src = z_src + a[0, c] * centroids[c]
-
-    z_src = _l2_normalize(z_src)
-    return z_src, s
+    device: torch.device,
+) -> torch.Tensor:
+    query = l2_normalize(query.to(device).float())
+    class_prototypes = prototypes.get(int(predicted_class))
+    if class_prototypes is None or class_prototypes.numel() == 0:
+        return torch.zeros_like(query)
+    class_prototypes = l2_normalize(class_prototypes.to(device).float())
+    similarities = (query @ class_prototypes.t()).squeeze(0)
+    count = min(max(1, int(topk)), similarities.numel())
+    indices = torch.topk(similarities, k=count, largest=True).indices
+    return l2_normalize(class_prototypes[indices].mean(dim=0, keepdim=True))
 
 
-def load_personalized_prototypes(path: str) -> Dict[Hashable, Dict[int, torch.Tensor]]:
-    obj = torch.load(path, map_location="cpu")
-    if not isinstance(obj, dict):
-        raise ValueError("Prototype file must be a dict (or payload dict containing 'personalized').")
-    if "personalized" in obj and isinstance(obj["personalized"], dict):
-        obj = obj["personalized"]
-    if not isinstance(obj, dict):
-        raise ValueError("Prototype file: invalid structure after unwrapping.")
+def load_personalized_prototypes(path: str) -> Dict[str, Dict[int, torch.Tensor]]:
+    payload = torch.load(path, map_location="cpu")
+    if isinstance(payload, dict) and isinstance(payload.get("personalized"), dict):
+        payload = payload["personalized"]
+    if not isinstance(payload, dict):
+        raise ValueError("Prototype file must contain a subject -> class -> tensor mapping.")
 
-    clean: Dict[Hashable, Dict[int, torch.Tensor]] = {}
-    for sid, by_cls in obj.items():
-        if not isinstance(by_cls, dict):
-            raise ValueError(f"Prototype file: subject '{sid}' must map to dict class->tensor")
-        sid_key = _as_subject_key(sid)
-        clean[sid_key] = {}
-        for c, P in by_cls.items():
-            if P is None:
-                continue
-            if not torch.is_tensor(P):
-                raise ValueError(f"Prototype file: subject '{sid}' class '{c}' must be a tensor")
-            if P.numel() == 0:
-                clean[sid_key][int(c)] = P.float()
-                continue
-            P = _l2_normalize(P.float())
-            clean[sid_key][int(c)] = P
+    clean: Dict[str, Dict[int, torch.Tensor]] = {}
+    for subject_id, by_class in payload.items():
+        if not isinstance(by_class, dict):
+            raise ValueError(f"Invalid prototype entry for subject {subject_id!r}.")
+        clean[str(subject_id)] = {}
+        for class_index, value in by_class.items():
+            if not torch.is_tensor(value):
+                raise ValueError(f"Prototype subject={subject_id}, class={class_index} is not a tensor.")
+            clean[str(subject_id)][int(class_index)] = l2_normalize(value.float()) if value.numel() else value.float()
     return clean
 
-def get_arguments():
-    p = argparse.ArgumentParser()
 
-    p.add_argument("--config", required=True, help="yaml config directory or file")
-    p.add_argument("--head-path", type=str, default=None, help="Path to trained CLIP head checkpoint.")
-    p.add_argument("--datasets", type=str, required=True, help="Datasets separated by / (e.g., biovid)")
-    p.add_argument("--data-root", type=str, default="./dataset/", help="Path to datasets directory.")
-    p.add_argument("--backbone", type=str, choices=["RN50", "ViT-B/16", "ViT-B/32"], required=True)
-
-    p.add_argument("--ft-clip-path", type=str, default=None, help="Path to fine-tuned CLIP checkpoint.")
-    p.add_argument("--proto-path", type=str, default=None, help="Path to personalized prototypes .pt")
-    p.add_argument("--default-subject", type=str, default="global", help="Fallback subject id when metadata absent.")
-
-    p.add_argument("--save-metrics", type=str, default=None, help="Optional JSON output path.")
-    p.add_argument("--save-metrics-txt", type=str, default=None, help="Optional TXT per-subject output path.")
-
-    p.add_argument("--window", type=int, default=3)
-    p.add_argument("--proto-topk", type=int, default=5)
-    p.add_argument("--cache-topk", type=int, default=5)
-    p.add_argument("--temporal", action="store_true", help="Use temporal transformer after CLIP image encoder.")
-    p.add_argument("--clip-len", type=int, default=8, help="Temporal window length for BioVid.")
-    p.add_argument("--temporal-layers", type=int, default=4, help="Number of temporal transformer layers.")
-    p.add_argument("--temporal-heads", type=int, default=8, help="Number of temporal attention heads.")
-    p.add_argument("--temporal-ff", type=int, default=2048, help="Temporal transformer FFN hidden dimension.")
-    p.add_argument("--temporal-max-len", type=int, default=256, help="Maximum temporal length supported.")
-    p.add_argument("--temporal-dropout", type=float, default=0.0, help="Temporal transformer dropout.")
-
-    p.add_argument(
-        "--gates",
-        type=str,
-        default="temp,entropy,proto",
-        help="Comma-separated cache-update gates: any subset of {temp,entropy,proto}.",
-    )
-    p.add_argument(
-        "--proto-missing",
-        type=str,
-        choices=["pass", "block"],
-        default="pass",
-        help="If proto gate enabled but subject has no prototypes: pass or block.",
-    )
-
-    p.add_argument(
-        "--fusion-space",
-        type=str,
-        choices=["logit", "embed"],
-        default="embed",
-        help="Fusion in logit space or embedding space.",
-    )
-    p.add_argument(
-        "--no-proto-fusion",
-        dest="use_proto_fusion",
-        action="store_false",
-        help="Disable prototype term in fusion.",
-    )
-    p.set_defaults(use_proto_fusion=True)
-
-    p.add_argument("--proto-gamma", type=float, default=10.0, help="Softmax sharpness for prototype embedding mix.")
-    p.add_argument("--input-res", type=int, default=224, help="Input resolution for GFLOPs estimation.")
-
-    return p.parse_args()
+def embedding_prediction(
+    embedding: torch.Tensor,
+    clip_weights: torch.Tensor,
+    logit_scale: torch.Tensor,
+) -> Tuple[int, float]:
+    logits = logit_scale.float() * (l2_normalize(embedding.float()) @ clip_weights.float())
+    probabilities = logits.softmax(dim=1)
+    confidence, prediction = probabilities.max(dim=1)
+    return int(prediction.item()), float(confidence.item())
 
 
-# Main TTA loop
+def nonzero_embedding(embedding: torch.Tensor, eps: float = 1e-10) -> bool:
+    return bool(float(embedding.norm().item()) > eps)
+
+
+def select_positive_components(
+    components: List[Tuple[str, torch.Tensor, int, float]],
+    agreement_mode: str,
+) -> List[Tuple[str, torch.Tensor, int, float]]:
+    if agreement_mode == "none" or len(components) <= 1:
+        return components
+    counts = Counter(component[2] for component in components)
+    majority_class, count = counts.most_common(1)[0]
+    if count >= 2:
+        return [component for component in components if component[2] == majority_class]
+    return [max(components, key=lambda component: component[3])]
+
+
+@torch.no_grad()
+def fuse_embeddings(
+    target_embedding: torch.Tensor,
+    source_embedding: torch.Tensor,
+    positive_embedding: torch.Tensor,
+    negative_embedding: torch.Tensor,
+    clip_weights: torch.Tensor,
+    logit_scale: torch.Tensor,
+    *,
+    weighting_strategy: str,
+    agreement_mode: str,
+    attention_temperature: float,
+    lambda_src: float,
+    lambda_pos: float,
+    lambda_neg: float,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    raw_positive = [("target", target_embedding, 1.0)]
+    if nonzero_embedding(source_embedding):
+        raw_positive.append(("source", source_embedding, float(lambda_src)))
+    if nonzero_embedding(positive_embedding):
+        raw_positive.append(("positive", positive_embedding, float(lambda_pos)))
+
+    positive_components: List[Tuple[str, torch.Tensor, int, float]] = []
+    for name, embedding, base_weight in raw_positive:
+        prediction, confidence = embedding_prediction(embedding, clip_weights, logit_scale)
+        positive_components.append((name, embedding, prediction, confidence * base_weight))
+    positive_components = select_positive_components(positive_components, agreement_mode)
+
+    negative_component = None
+    if nonzero_embedding(negative_embedding):
+        prediction, confidence = embedding_prediction(negative_embedding, clip_weights, logit_scale)
+        negative_component = ("negative", negative_embedding, prediction, confidence * float(lambda_neg))
+
+    names = [component[0] for component in positive_components]
+    scores = torch.tensor([component[3] for component in positive_components], device=target_embedding.device)
+    if negative_component is not None:
+        names.append("negative")
+        scores = torch.cat([scores, torch.tensor([negative_component[3]], device=scores.device)])
+
+    if weighting_strategy == "equal":
+        weights = torch.ones_like(scores)
+        # Preserve the explicit lambda values for equal fusion.
+        for index, component in enumerate(positive_components):
+            weights[index] = 1.0 if component[0] == "target" else (lambda_src if component[0] == "source" else lambda_pos)
+        if negative_component is not None:
+            weights[-1] = lambda_neg
+    elif weighting_strategy == "confidence":
+        weights = scores
+    elif weighting_strategy == "attention":
+        temperature = max(float(attention_temperature), 1e-6)
+        weights = torch.softmax(scores / temperature, dim=0)
+    else:
+        raise ValueError(f"Unknown weighting strategy: {weighting_strategy}")
+
+    fused = torch.zeros_like(target_embedding)
+    details: Dict[str, float] = {}
+    for index, component in enumerate(positive_components):
+        fused = fused + weights[index] * component[1]
+        details[f"weight_{component[0]}"] = float(weights[index].item())
+        details[f"confidence_{component[0]}"] = float(component[3])
+    if negative_component is not None:
+        fused = fused - weights[-1] * negative_component[1]
+        details["weight_negative"] = float(weights[-1].item())
+        details["confidence_negative"] = float(negative_component[3])
+    else:
+        details["weight_negative"] = 0.0
+
+    return l2_normalize(fused), details
+
+
+def count_parameters(model: torch.nn.Module) -> Tuple[int, int]:
+    total = sum(parameter.numel() for parameter in model.parameters())
+    trainable = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+    return total, trainable
+
+
+@torch.no_grad()
+def estimate_visual_gflops(model, device: torch.device, input_resolution: int) -> Optional[float]:
+    visual = model.backbone.visual if hasattr(model, "backbone") else model.visual
+    sample = torch.randn(1, 3, input_resolution, input_resolution, device=device)
+    try:
+        from fvcore.nn import FlopCountAnalysis  # type: ignore
+        return float(FlopCountAnalysis(visual, sample).total()) / 1e9
+    except Exception:
+        return None
+
+
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="TTA-CaP online test-time adaptation.")
+    parser.add_argument("--config", required=True, help="Config directory or YAML file.")
+    parser.add_argument("--datasets", required=True, help="Dataset names separated by '/', e.g. biovid/stressid.")
+    parser.add_argument("--data-root", required=True, help="Parent data root or exact dataset root.")
+    parser.add_argument("--backbone", required=True, choices=["RN50", "ViT-B/16", "ViT-B/32"])
+    parser.add_argument("--ft-clip-path", default=None, help="Source-trained CLIP checkpoint.")
+    parser.add_argument("--temporal-ckpt-path", default=None, help="Optional full VClip/temporal checkpoint.")
+    parser.add_argument("--head-path", default=None, help="Optional frozen linear classifier checkpoint.")
+    parser.add_argument("--proto-path", required=True, help="Personalized prototype cache file.")
+    parser.add_argument("--save-metrics", default=None, help="JSON output path.")
+    parser.add_argument("--save-metrics-txt", default=None, help="Plain-text output path.")
+    parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--num-workers", type=int, default=4)
+
+    parser.add_argument("--temporal", action="store_true")
+    parser.add_argument("--clip-len", type=int, default=8, help="Causal temporal encoder clip length.")
+    parser.add_argument("--temporal-layers", type=int, default=4)
+    parser.add_argument("--temporal-heads", type=int, default=8)
+    parser.add_argument("--temporal-ff", type=int, default=2048)
+    parser.add_argument("--temporal-max-len", type=int, default=256)
+    parser.add_argument("--temporal-dropout", type=float, default=0.0)
+
+    parser.add_argument("--window", type=int, default=3, help="Tri-gate prediction-history window W.")
+    parser.add_argument("--proto-topk", type=int, default=5)
+    parser.add_argument("--cache-topk", type=int, default=5)
+    parser.add_argument("--gates", default="temp,entropy,proto")
+    parser.add_argument("--proto-missing", choices=["pass", "block"], default="block")
+    parser.add_argument("--fusion-space", choices=["embed", "logit"], default="embed")
+    parser.add_argument("--weighting-strategy", choices=["equal", "confidence", "attention"], default="equal")
+    parser.add_argument("--agreement-mode", choices=["none", "majority"], default="none")
+    parser.add_argument("--attention-temperature", type=float, default=1.0)
+    parser.add_argument("--input-res", type=int, default=224)
+    return parser.parse_args()
+
 
 @torch.no_grad()
 def run_online_tta(
     loader: Iterable,
     clip_model,
-    clip_weights: torch.Tensor,  # [D,C]
-    proto_db: Optional[Dict[Hashable, Dict[int, torch.Tensor]]],
-    head=None,
+    clip_weights: torch.Tensor,
+    prototype_database: Dict[str, Dict[int, torch.Tensor]],
     *,
+    head: Optional[torch.nn.Module],
     window: int,
     proto_topk: int,
     cache_topk: int,
-    tau_H_pos: float,
-    tau_H_neg: float,
-    tau_delta: float,
-    L_pos: int,
-    L_neg: int,
-    beta: float,
+    tau_entropy_positive: float,
+    tau_entropy_negative: float,
+    tau_prototype_margin: float,
+    positive_capacity: int,
+    negative_capacity: int,
+    cache_beta: float,
     lambda_src: float,
     lambda_pos: float,
     lambda_neg: float,
-    default_subject: Hashable,
     gates: str,
     proto_missing: str,
     fusion_space: str,
-    use_proto_fusion: bool,
-    proto_gamma: float,
+    weighting_strategy: str,
+    agreement_mode: str,
+    attention_temperature: float,
     save_metrics_path: Optional[str],
     save_metrics_txt: Optional[str],
-    model_stats: Optional[Dict[str, object]] = None,
+    model_stats: Dict[str, object],
 ) -> float:
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = clip_weights.device
+    num_classes = clip_weights.shape[1]
+    logit_scale = clip_model.logit_scale.exp().float() if hasattr(clip_model, "logit_scale") else torch.tensor(100.0, device=device)
+    enabled_gates = {gate.strip().lower() for gate in gates.split(",") if gate.strip()}
+    unknown_gates = enabled_gates - {"temp", "entropy", "proto"}
+    if unknown_gates:
+        raise ValueError(f"Unknown gates: {sorted(unknown_gates)}")
+
+    current_stream: Optional[Tuple[str, str]] = None
+    completed_streams: set[Tuple[str, str]] = set()
+    positive_cache: Optional[BoundedCache] = None
+    negative_cache: Optional[BoundedCache] = None
+    history: Optional[PredictionHistory] = None
+
+    video_logits: Dict[Tuple[str, str], torch.Tensor] = defaultdict(
+        lambda: torch.zeros((1, num_classes), device=device)
+    )
+    video_counts: Dict[Tuple[str, str], int] = defaultdict(int)
+    video_ground_truth: Dict[Tuple[str, str], int] = {}
+
+    gate_counts = Counter()
+    per_video_fusion_weights: Dict[Tuple[str, str], List[Dict[str, float]]] = defaultdict(list)
+    frame_count = 0
+    positive_updates = 0
+    negative_updates = 0
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
-    t_start = time.perf_counter()
-    n_frames_total = 0
+    start_time = time.perf_counter()
 
-    clip_weights_model = _to_device(clip_weights, device)
-    clip_weights_f32 = clip_weights_model.float()
-    C = clip_weights_model.size(1)
+    for batch in tqdm(loader, desc="Online TTA frames"):
+        if not isinstance(batch, (list, tuple)) or len(batch) < 3:
+            raise ValueError("The test loader must return (image, target, metadata).")
+        images, target, metadata = batch[0], batch[1], batch[2]
+        subject_id = as_key(metadata["subject_id"])
+        video_id = as_key(metadata["video_id"])
+        stream_key = (subject_id, video_id)
 
-    gates_set = {g.strip().lower() for g in gates.split(",") if g.strip()}
-    use_temp_gate = ("temp" in gates_set)
-    use_entropy_gate = ("entropy" in gates_set)
-    use_proto_gate = ("proto" in gates_set)
+        if current_stream != stream_key:
+            if stream_key in completed_streams:
+                raise RuntimeError(
+                    f"Video stream {stream_key} is not contiguous. Keep frames sorted by subject, video, and frame."
+                )
+            if current_stream is not None:
+                completed_streams.add(current_stream)
+            current_stream = stream_key
+            positive_cache = BoundedCache(num_classes, positive_capacity, device)
+            negative_cache = BoundedCache(num_classes, negative_capacity, device)
+            history = PredictionHistory(window)
 
-    print(
-        f"[Ablation] update_gates={sorted(list(gates_set))} | "
-        f"proto_missing={proto_missing} | fusion_space={fusion_space} | proto_fusion={use_proto_fusion}"
-    )
-
-    pos_cache: Dict[Hashable, BoundedCache] = {}
-    neg_cache: Dict[Hashable, BoundedCache] = {}
-    ring: Dict[Hashable, RingBuffer] = {}
-
-    video_sum: Dict[Tuple[Hashable, Hashable], torch.Tensor] = defaultdict(
-        lambda: torch.zeros((1, C), device=device)
-    )
-    video_cnt: Dict[Tuple[Hashable, Hashable], int] = defaultdict(int)
-    video_gt: Dict[Tuple[Hashable, Hashable], int] = {}
-
-    per_subj_ytrue: Dict[Hashable, List[int]] = defaultdict(list)
-    per_subj_ypred: Dict[Hashable, List[int]] = defaultdict(list)
-    all_ytrue: List[int] = []
-    all_ypred: List[int] = []
-
-    frame_counter = 0
-
-    def pass_gate(flag_use: bool, gate_value: int) -> bool:
-        return (not flag_use) or bool(gate_value)
-
-    for batch in tqdm(loader, desc="Processed test frames: "):
-        n_frames_total += 1
-
-        if isinstance(batch, (list, tuple)) and len(batch) == 2:
-            images, target = batch
-            meta = {}
-        elif isinstance(batch, (list, tuple)) and len(batch) >= 3:
-            images, target, meta = batch[0], batch[1], batch[2]
-        else:
-            raise ValueError("Unexpected batch format. Expected (images, target) or (images, target, meta).")
-
-        target = _to_device(target, device)
-
-        subj_raw = meta.get("subject_id", default_subject) if isinstance(meta, dict) else default_subject
-        vid_raw = meta.get("video_id", None) if isinstance(meta, dict) else None
-        imp_raw = meta.get("impath", None) if isinstance(meta, dict) else None
-
-        subj = _as_subject_key(subj_raw)
-        vid = _unwrap(vid_raw)
-
-        if vid is None:
-            vid = _unwrap(imp_raw) if imp_raw is not None else f"frame_{frame_counter}"
-        frame_counter += 1
-
-        if subj not in pos_cache:
-            pos_cache[subj] = BoundedCache(C, L_pos, device)
-            neg_cache[subj] = BoundedCache(C, L_neg, device)
-            ring[subj] = RingBuffer(window)
-
-        z_t, logits_base, ent_base, _prob_map, pred_base = get_clip_logits(
-            images, clip_model, clip_weights_model, head=head
+        assert positive_cache is not None and negative_cache is not None and history is not None
+        target = target.to(device, non_blocking=True)
+        target_embedding, base_logits, entropy_tensor, probabilities, predicted_class = get_clip_logits(
+            images, clip_model, clip_weights, device, head=head
         )
+        target_embedding = l2_normalize(target_embedding.float())
+        entropy = float(entropy_tensor.item())
+        least_likely_class = int(probabilities.argmin(dim=1).item())
+        frame_count += 1
 
-        z_t = _to_device(z_t, device).float()
-        logits_base = _to_device(logits_base, device).float()
+        history.append(predicted_class)
+        temporal_pass = int(predicted_class == history.majority())
+        entropy_confident = int(entropy < tau_entropy_positive)
+        entropy_ambiguous = int(tau_entropy_positive <= entropy < tau_entropy_negative)
+        entropy_admissible = int(entropy < tau_entropy_negative)
 
-        if z_t.dim() != 2 or z_t.size(0) != 1:
-            raise RuntimeError("This runner expects batch_size=1 in the test loader (per-frame streaming).")
-
-        z_t = _l2_normalize(z_t)
-        p_t = torch.softmax(logits_base, dim=1)
-        H_t = float(ent_base.mean().item()) if torch.is_tensor(ent_base) else float(ent_base)
-        y_t = int(pred_base)
-
-
-        # Temporal gate
-
-        ring[subj].push(BufferItem(pred=y_t))
-        maj_t = ring[subj].maj_label()
-        temp_ok = int(y_t == maj_t)
-
-        # Entropy gate
-
-        conf_ok = int(H_t < tau_H_pos)
-        amb_ok = int((tau_H_pos <= H_t) and (H_t < tau_H_neg))
-
-
-        # Prototype gate
-
-        subj_proto = None
-        if proto_db is not None:
-            subj_proto = proto_db.get(subj, None)
-            if subj_proto is None:
-                subj_proto = proto_db.get(str(subj), None)
-            if subj_proto is None and len(proto_db) == 1:
-                subj_proto = next(iter(proto_db.values()))
-
-        proto_available = subj_proto is not None
-
-        if not proto_available:
-            s = torch.zeros((1, C), device=device)
-            z_src = torch.zeros_like(z_t)
-            if use_proto_gate and proto_missing == "block":
-                proto_ok = 0
-                margin_ok = 0
-            else:
-                proto_ok = 1
-                margin_ok = 1
-        else:
-            s = prototype_scores(z_t, subj_proto, C, topk=proto_topk, device=device)
-            topv, topi = torch.topk(s, k=min(2, C), dim=1, largest=True)
-
-            c_star = int(topi[0, 0].item())
-            delta = float((topv[0, 0] - topv[0, 1]).item()) if topv.shape[1] >= 2 else float("inf")
-
-            proto_ok = int((c_star == y_t) and (delta > tau_delta))
-            margin_ok = int(delta > tau_delta)
-
-            z_src, _ = prototype_embed(
-                z_t, subj_proto, C, topk=proto_topk, device=device, gamma=proto_gamma
+        subject_prototypes = prototype_database.get(subject_id)
+        prototypes_available = bool(
+            subject_prototypes
+            and any(tensor.numel() > 0 for tensor in subject_prototypes.values())
+        )
+        if prototypes_available:
+            scores = prototype_scores(
+                target_embedding, subject_prototypes, num_classes, proto_topk, device
             )
-
-
-        # Cache updates
-
-        pos_update_ok = (
-            pass_gate(use_temp_gate, temp_ok) and
-            pass_gate(use_entropy_gate, conf_ok) and
-            pass_gate(use_proto_gate, proto_ok)
-        )
-        neg_update_ok = (
-            pass_gate(use_temp_gate, temp_ok) and
-            pass_gate(use_entropy_gate, amb_ok) and
-            pass_gate(use_proto_gate, margin_ok)
-        )
-
-        if pos_update_ok:
-            pos_cache[subj].add(z_t, y_t, H_t)
-        elif neg_update_ok:
-            neg_cache[subj].add(z_t, y_t, H_t)
-
-        # Fusion + final logits
-        if fusion_space == "logit":
-            l_pos = pos_cache[subj].aggregate_labels(z_t, beta=beta, k=cache_topk)
-            l_neg = neg_cache[subj].aggregate_labels(z_t, beta=beta, k=cache_topk)
-
-            if not use_proto_fusion:
-                s = torch.zeros((1, C), device=device)
-
-            logits_final = logits_base + (lambda_src * s) + (lambda_pos * l_pos) - (lambda_neg * l_neg)
-
-        else:
-            z_pos = pos_cache[subj].aggregate_embed(z_t, beta=beta, k=cache_topk)
-            z_neg = neg_cache[subj].aggregate_embed(z_t, beta=beta, k=cache_topk)
-
-            if not use_proto_fusion:
-                z_src = torch.zeros_like(z_t)
-
-            z_fused = _l2_normalize(
-                z_t + (lambda_src * z_src) + (lambda_pos * z_pos) - (lambda_neg * z_neg)
+            values, indices = torch.topk(scores, k=min(2, num_classes), dim=1)
+            prototype_class = int(indices[0, 0].item())
+            margin = float(values[0, 0].item() - values[0, 1].item()) if num_classes > 1 else float("inf")
+            prototype_pass = int(prototype_class == predicted_class and margin > tau_prototype_margin)
+            source_embedding = retrieve_source_embedding(
+                target_embedding,
+                subject_prototypes,
+                predicted_class,
+                proto_topk,
+                device,
             )
+        else:
+            scores = torch.zeros((1, num_classes), device=device)
+            source_embedding = torch.zeros_like(target_embedding)
+            prototype_pass = int(proto_missing == "pass")
 
-            if head is not None:
-                logits_final = head(z_fused)
-            else:
-                logits_final = z_fused @ clip_weights_f32
-                if hasattr(clip_model, "logit_scale"):
-                    logits_final = clip_model.logit_scale.exp().float() * logits_final
+        # Retrieve before update to prevent the current sample from retrieving itself.
+        positive_embedding = positive_cache.retrieve_embedding(
+            target_embedding, predicted_class, cache_topk, cache_beta
+        )
+        negative_embedding = negative_cache.retrieve_embedding(
+            target_embedding, predicted_class, cache_topk, cache_beta
+        )
 
-        # Video-level aggregation on final logits
+        if fusion_space == "embed":
+            fused_embedding, fusion_details = fuse_embeddings(
+                target_embedding,
+                source_embedding,
+                positive_embedding,
+                negative_embedding,
+                clip_weights,
+                logit_scale,
+                weighting_strategy=weighting_strategy,
+                agreement_mode=agreement_mode,
+                attention_temperature=attention_temperature,
+                lambda_src=lambda_src,
+                lambda_pos=lambda_pos,
+                lambda_neg=lambda_neg,
+            )
+            final_logits = head(fused_embedding) if head is not None else logit_scale * (fused_embedding @ clip_weights.float())
+            per_video_fusion_weights[stream_key].append(fusion_details)
+        else:
+            positive_scores = positive_cache.retrieve_label_scores(target_embedding, cache_topk, cache_beta)
+            negative_scores = negative_cache.retrieve_label_scores(target_embedding, cache_topk, cache_beta)
+            final_logits = base_logits + lambda_src * scores + lambda_pos * positive_scores - lambda_neg * negative_scores
 
-        key = (subj, vid)
-        video_sum[key] = video_sum[key] + logits_final
-        video_cnt[key] += 1
+        video_logits[stream_key] += final_logits
+        video_counts[stream_key] += 1
+        if stream_key not in video_ground_truth:
+            video_ground_truth[stream_key] = int(unwrap(target))
 
-        if key not in video_gt:
-            t = _unwrap(target)
-            if torch.is_tensor(t):
-                t = t.item() if t.numel() == 1 else t[0].item()
-            video_gt[key] = int(t)
+        temp_condition = temporal_pass if "temp" in enabled_gates else 1
+        proto_condition = prototype_pass if "proto" in enabled_gates else 1
+        entropy_condition = entropy_admissible if "entropy" in enabled_gates else 1
+        common_condition = bool(temp_condition and proto_condition)
 
+        positive_update = common_condition and (
+            bool(entropy_confident) if "entropy" in enabled_gates else True
+        )
+        negative_update = common_condition and (
+            bool(entropy_ambiguous) if "entropy" in enabled_gates else False
+        )
+
+        if positive_update:
+            positive_cache.add(target_embedding, predicted_class, entropy)
+            positive_updates += 1
+        elif negative_update:
+            # The least-likely class indexes the negative cache partition.
+            negative_cache.add(target_embedding, least_likely_class, entropy)
+            negative_updates += 1
+
+        gate_counts["temporal"] += temporal_pass
+        gate_counts["entropy"] += entropy_admissible
+        gate_counts["prototype"] += prototype_pass
+        gate_counts["all"] += int(temporal_pass and entropy_admissible and prototype_pass)
+
+    if current_stream is not None:
+        completed_streams.add(current_stream)
     if torch.cuda.is_available():
         torch.cuda.synchronize()
-    t_end = time.perf_counter()
+    elapsed = time.perf_counter() - start_time
 
-    elapsed_sec = t_end - t_start
-    n_videos_total = max(1, len(video_sum))
-    time_per_frame_ms = 1000.0 * elapsed_sec / max(1, n_frames_total)
-    time_per_video_ms = 1000.0 * elapsed_sec / n_videos_total
+    per_subject_true: Dict[str, List[int]] = defaultdict(list)
+    per_subject_pred: Dict[str, List[int]] = defaultdict(list)
+    all_true: List[int] = []
+    all_pred: List[int] = []
+    per_video_records: List[Dict] = []
 
-    per_video_records = []
-    for key, logit_sum in video_sum.items():
-        subj, vid = key
-        cnt = max(1, video_cnt[key])
-        logit_avg = (logit_sum / float(cnt)).detach()
+    for stream_key in sorted(video_logits, key=lambda key: (natural_key(key[0]), natural_key(key[1]))):
+        subject_id, video_id = stream_key
+        average_logits = video_logits[stream_key] / max(1, video_counts[stream_key])
+        prediction = int(average_logits.argmax(dim=1).item())
+        ground_truth = video_ground_truth[stream_key]
+        per_subject_true[subject_id].append(ground_truth)
+        per_subject_pred[subject_id].append(prediction)
+        all_true.append(ground_truth)
+        all_pred.append(prediction)
 
-        pred = int(torch.argmax(logit_avg, dim=1).item())
-        gt = int(video_gt[key])
+        weight_records = per_video_fusion_weights.get(stream_key, [])
+        mean_weights: Dict[str, float] = {}
+        if weight_records:
+            keys = sorted({key for record in weight_records for key in record})
+            for key in keys:
+                values = [record[key] for record in weight_records if key in record]
+                mean_weights[key] = float(sum(values) / len(values))
 
-        per_subj_ytrue[subj].append(gt)
-        per_subj_ypred[subj].append(pred)
-        all_ytrue.append(gt)
-        all_ypred.append(pred)
+        per_video_records.append(
+            {
+                "subject_id": subject_id,
+                "video_id": video_id,
+                "n_frames": video_counts[stream_key],
+                "y_true": ground_truth,
+                "y_pred": prediction,
+                "logits_avg": average_logits.squeeze(0).cpu().tolist(),
+                "mean_fusion_weights": mean_weights,
+            }
+        )
 
-        per_video_records.append({
-            "subject_id": str(subj),
-            "video_id": str(vid),
-            "n_frames": int(cnt),
-            "y_true": int(gt),
-            "y_pred": int(pred),
-            "logits_avg": logit_avg.squeeze(0).float().cpu().tolist(),
-        })
-
-    per_subject_metrics = {}
-    for subj in per_subj_ytrue.keys():
-        m = compute_metrics_from_lists(per_subj_ytrue[subj], per_subj_ypred[subj], num_classes=C)
-        per_subject_metrics[str(subj)] = {
-            "N_videos": int(len(per_subj_ytrue[subj])),
-            "WAR": float(m["WAR"]),
-            "UAR": float(m["UAR"]),
-            "F1_macro": float(m["F1_macro"]),
+    per_subject = {
+        subject_id: {
+            "N_videos": len(per_subject_true[subject_id]),
+            **compute_metrics(per_subject_true[subject_id], per_subject_pred[subject_id], num_classes),
         }
-
-    m_all = compute_metrics_from_lists(all_ytrue, all_ypred, num_classes=C)
-    overall = {
-        "N_videos": int(len(all_ytrue)),
-        "WAR": float(m_all["WAR"]),
-        "UAR": float(m_all["UAR"]),
-        "F1_macro": float(m_all["F1_macro"]),
+        for subject_id in sorted(per_subject_true, key=natural_key)
+    }
+    overall = {"N_videos": len(all_true), **compute_metrics(all_true, all_pred, num_classes)}
+    pass_rates = {
+        key: 100.0 * gate_counts[key] / max(1, frame_count)
+        for key in ("temporal", "entropy", "prototype", "all")
+    }
+    runtime = {
+        "n_frames_total": frame_count,
+        "n_videos_total": len(video_logits),
+        "total_runtime_sec": elapsed,
+        "time_per_frame_ms": 1000.0 * elapsed / max(1, frame_count),
+        "time_per_video_ms": 1000.0 * elapsed / max(1, len(video_logits)),
+    }
+    settings = {
+        "gates": sorted(enabled_gates),
+        "fusion_space": fusion_space,
+        "weighting_strategy": weighting_strategy,
+        "agreement_mode": agreement_mode,
+        "attention_temperature": attention_temperature,
+        "positive_updates": positive_updates,
+        "negative_updates": negative_updates,
     }
 
-    if save_metrics_txt is not None:
-        lines = []
-        lines.append("Per-target-subject (video-level) metrics\n")
-        lines.append("subject_id\tN_videos\tWAR\tUAR\tF1_macro\n")
-        for subj in sorted(per_subject_metrics.keys(), key=lambda x: int(x) if x.isdigit() else x):
-            s_m = per_subject_metrics[subj]
-            lines.append(f"{subj}\t{s_m['N_videos']}\t{s_m['WAR']:.4f}\t{s_m['UAR']:.4f}\t{s_m['F1_macro']:.4f}\n")
+    payload = {
+        "overall": overall,
+        "per_subject": per_subject,
+        "per_video": per_video_records,
+        "gate_pass_rates": pass_rates,
+        "runtime": runtime,
+        "settings": settings,
+        "model_stats": model_stats,
+    }
 
-        lines.append("\nOverall (all subjects)\n")
-        lines.append(f"N_videos\t{overall['N_videos']}\n")
-        lines.append(f"WAR\t{overall['WAR']:.4f}\n")
-        lines.append(f"UAR\t{overall['UAR']:.4f}\n")
-        lines.append(f"F1_macro\t{overall['F1_macro']:.4f}\n")
-
-        lines.append("\nRuntime / compute stats\n")
-        lines.append(f"n_frames_total\t{n_frames_total}\n")
-        lines.append(f"n_videos_total\t{len(video_sum)}\n")
-        lines.append(f"total_runtime_sec\t{elapsed_sec:.6f}\n")
-        lines.append(f"time_per_frame_ms\t{time_per_frame_ms:.6f}\n")
-        lines.append(f"time_per_video_ms\t{time_per_video_ms:.6f}\n")
-
-        if model_stats is not None:
-            lines.append("\nModel stats\n")
-            lines.append(f"backbone\t{model_stats.get('backbone')}\n")
-            lines.append(f"clip_params_total\t{model_stats.get('clip_params_total')}\n")
-            lines.append(f"clip_params_trainable\t{model_stats.get('clip_params_trainable')}\n")
-            lines.append(f"head_params_total\t{model_stats.get('head_params_total')}\n")
-            lines.append(f"head_params_trainable\t{model_stats.get('head_params_trainable')}\n")
-            g = model_stats.get("gflops_visual", None)
-            lines.append(f"gflops_visual\t{('NA' if g is None else f'{float(g):.4f}')}\n")
-
-        lines.append("\nRun settings\n")
-        lines.append(f"update_gates\t{','.join(sorted(list(gates_set)))}\n")
-        lines.append(f"proto_missing\t{proto_missing}\n")
-        lines.append(f"fusion_space\t{fusion_space}\n")
-        lines.append(f"proto_fusion\t{int(use_proto_fusion)}\n")
-        lines.append(f"proto_gamma\t{proto_gamma}\n")
-
-        with open(save_metrics_txt, "w") as ftxt:
-            ftxt.writelines(lines)
-        print(f"[Saved per-subject TXT] {save_metrics_txt}")
-
-    print("\nPer-target-subject (video-level) metrics:")
-    for subj in sorted(per_subject_metrics.keys(), key=lambda x: int(x) if x.isdigit() else x):
-        s_m = per_subject_metrics[subj]
+    print("\nPer-subject video-level results")
+    for subject_id, values in per_subject.items():
         print(
-            f"  subject {subj}: N_videos={s_m['N_videos']:4d} | "
-            f"WAR={s_m['WAR']:.2f} | UAR={s_m['UAR']:.2f} | F1_macro={s_m['F1_macro']:.2f}"
+            f"  {subject_id}: N={values['N_videos']} | "
+            f"WAR={values['WAR']:.2f} | F1={values['F1_macro']:.2f}"
         )
-
     print(
-        f"\nOverall (all subjects) | N_videos={overall['N_videos']} | "
-        f"WAR={overall['WAR']:.2f} | UAR={overall['UAR']:.2f} | F1_macro={overall['F1_macro']:.2f}\n"
+        f"Overall: N={overall['N_videos']} | WAR={overall['WAR']:.2f} | "
+        f"F1={overall['F1_macro']:.2f}"
     )
-    print(f"[Runtime] total={elapsed_sec:.3f}s | per_frame={time_per_frame_ms:.3f}ms | per_video={time_per_video_ms:.3f}ms")
+    print(
+        "Gate pass rates: "
+        + ", ".join(f"{key}={value:.2f}%" for key, value in pass_rates.items())
+    )
 
-    if save_metrics_path is not None:
-        payload = {
-            "overall": overall,
-            "per_subject": per_subject_metrics,
-            "per_video": sorted(
-                per_video_records,
-                key=lambda r: (
-                    int(r["subject_id"]) if r["subject_id"].isdigit() else r["subject_id"],
-                    r["video_id"],
-                ),
-            ),
-            "settings": {
-                "update_gates": sorted(list(gates_set)),
-                "proto_missing": proto_missing,
-                "fusion_space": fusion_space,
-                "proto_fusion": bool(use_proto_fusion),
-                "proto_gamma": proto_gamma,
-            },
-            "runtime": {
-                "n_frames_total": n_frames_total,
-                "n_videos_total": len(video_sum),
-                "total_runtime_sec": elapsed_sec,
-                "time_per_frame_ms": time_per_frame_ms,
-                "time_per_video_ms": time_per_video_ms,
-            },
-            "model_stats": model_stats,
-        }
-        with open(save_metrics_path, "w") as fjson:
-            json.dump(payload, fjson, indent=2)
-        print(f"[Saved metrics] {save_metrics_path}")
+    if save_metrics_path:
+        path = Path(save_metrics_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+        print(f"Saved JSON metrics: {path}")
+
+    if save_metrics_txt:
+        path = Path(save_metrics_txt)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lines = ["subject_id\tN_videos\tWAR\tF1_macro\n"]
+        for subject_id, values in per_subject.items():
+            lines.append(
+                f"{subject_id}\t{values['N_videos']}\t{values['WAR']:.4f}\t{values['F1_macro']:.4f}\n"
+            )
+        lines.extend(
+            [
+                "\nOverall\n",
+                f"N_videos\t{overall['N_videos']}\n",
+                f"WAR\t{overall['WAR']:.4f}\n",
+                f"F1_macro\t{overall['F1_macro']:.4f}\n",
+                "\nGate pass rates (%)\n",
+            ]
+        )
+        lines.extend(f"{key}\t{value:.4f}\n" for key, value in pass_rates.items())
+        lines.extend(
+            [
+                "\nRuntime\n",
+                f"n_frames_total\t{runtime['n_frames_total']}\n",
+                f"n_videos_total\t{runtime['n_videos_total']}\n",
+                f"total_runtime_sec\t{runtime['total_runtime_sec']:.6f}\n",
+                f"time_per_frame_ms\t{runtime['time_per_frame_ms']:.6f}\n",
+                f"time_per_video_ms\t{runtime['time_per_video_ms']:.6f}\n",
+            ]
+        )
+        with path.open("w", encoding="utf-8") as handle:
+            handle.writelines(lines)
+        print(f"Saved TXT metrics: {path}")
 
     return float(overall["WAR"])
 
 
-def main():
-    args = get_arguments()
+def load_optional_head(path: Optional[str], device: torch.device) -> Optional[torch.nn.Module]:
+    if not path:
+        return None
+    checkpoint = torch.load(path, map_location="cpu")
+    if not isinstance(checkpoint, dict) or "state_dict" not in checkpoint:
+        raise ValueError("Head checkpoint must contain state_dict, feat_dim, and classnames.")
+    head = torch.nn.Linear(int(checkpoint["feat_dim"]), len(checkpoint["classnames"]))
+    head.load_state_dict(checkpoint["state_dict"])
+    return head.to(device).eval()
 
-    device_str = "cuda" if torch.cuda.is_available() else "cpu"
-    device = torch.device(device_str)
 
-    base_clip_model, preprocess = clip.load(args.backbone, device=device_str)
+def main() -> None:
+    args = parse_arguments()
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    base_clip, preprocess = clip.load(args.backbone, device=str(device), jit=False)
+    missing, unexpected = load_clip_backbone_checkpoint(base_clip, args.ft_clip_path)
     if args.ft_clip_path:
-        ckpt = torch.load(args.ft_clip_path, map_location="cpu")
-        state = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
-        missing, unexpected = base_clip_model.load_state_dict(state, strict=False)
-        print(f"[FT-CLIP] Loaded: {args.ft_clip_path}")
-        if len(missing) > 0:
-            print(f"[FT-CLIP] Missing keys: {len(missing)}")
-        if len(unexpected) > 0:
-            print(f"[FT-CLIP] Unexpected keys: {len(unexpected)}")
+        print(f"Loaded CLIP checkpoint: {args.ft_clip_path}")
+        print(f"  missing={len(missing)}, unexpected={len(unexpected)}")
 
     if args.temporal:
-        if args.backbone != "ViT-B/32":
-            print("[Warning] Current temporal wrapper assumes d_model=512. ViT-B/32 is safest.")
-
+        embedding_dim = int(getattr(base_clip.visual, "output_dim", 512))
         clip_model = VClip(
-            backbone=base_clip_model,
-            d_model=512,
+            backbone=base_clip,
+            d_model=embedding_dim,
             nhead=args.temporal_heads,
             num_layers=args.temporal_layers,
             dim_forward=args.temporal_ff,
@@ -792,104 +724,79 @@ def main():
             dropout=args.temporal_dropout,
             freeze_backbone=True,
         ).to(device)
+        temporal_checkpoint = args.temporal_ckpt_path or args.ft_clip_path
+        missing, unexpected = load_vclip_checkpoint(clip_model, temporal_checkpoint)
+        if temporal_checkpoint:
+            print(f"Loaded VClip-compatible checkpoint: {temporal_checkpoint}")
+            print(f"  missing={len(missing)}, unexpected={len(unexpected)}")
+        temporal_missing = [key for key in missing if key.startswith("temporal.")]
+        if temporal_missing:
+            print(
+                "[Warning] Temporal encoder parameters are missing; "
+                "provide --temporal-ckpt-path for the trained temporal model."
+            )
     else:
-        clip_model = base_clip_model
-
+        clip_model = base_clip
     clip_model.eval()
 
-    random.seed(1)
-    torch.manual_seed(1)
-
-    proto_db = load_personalized_prototypes(args.proto_path) if args.proto_path else None
-
-    head = None
-    if args.head_path:
-        ckpt = torch.load(args.head_path, map_location="cpu")
-        feat_dim = int(ckpt["feat_dim"])
-        num_classes = len(ckpt["classnames"])
-        head = torch.nn.Linear(feat_dim, num_classes)
-        head.load_state_dict(ckpt["state_dict"])
-        head = head.to(device_str)
-        head.eval()
-
-    clip_total, clip_train = count_params(clip_model)
-    head_total, head_train = (0, 0)
-    if head is not None:
-        head_total, head_train = count_params(head)
-
-    gflops_visual = estimate_gflops_clip_visual(clip_model, device=device, input_res=args.input_res)
-
+    prototype_database = load_personalized_prototypes(args.proto_path)
+    head = load_optional_head(args.head_path, device)
+    total_parameters, trainable_parameters = count_parameters(clip_model)
     model_stats = {
         "backbone": args.backbone,
-        "clip_params_total": int(clip_total),
-        "clip_params_trainable": int(clip_train),
-        "head_params_total": int(head_total),
-        "head_params_trainable": int(head_train),
-        "gflops_visual": (None if gflops_visual is None else float(gflops_visual)),
-        "gflops_input_res": int(args.input_res),
+        "parameters_total": total_parameters,
+        "parameters_trainable": trainable_parameters,
+        "visual_gflops": estimate_visual_gflops(clip_model, device, args.input_res),
     }
 
-    datasets = args.datasets.split("/")
-    for dataset_name in datasets:
-        print(f"Processing {dataset_name} dataset.")
-        cfg = get_config_file(args.config, dataset_name)
-        print("\nRunning dataset configurations:\n", cfg, "\n")
-
-        test_loader, classnames, template = build_test_data_loader(
+    dataset_names = [name.strip() for name in args.datasets.split("/") if name.strip()]
+    for dataset_name in dataset_names:
+        config = get_config_file(args.config, dataset_name)
+        loader, classnames, templates = build_test_data_loader(
             dataset_name,
             args.data_root,
             preprocess,
+            config,
             temporal=args.temporal,
             clip_len=args.clip_len,
+            num_workers=args.num_workers,
         )
-        clip_weights = clip_classifier(classnames, template, clip_model)
+        clip_weights = clip_classifier(classnames, templates, clip_model, device)
 
-        tri = cfg.get("tri_gate", {})
-        ent_cfg = tri.get("entropy", {})
-        tau_H_pos = float(ent_cfg.get("tau_pos", 0.5))
-        tau_H_neg = float(ent_cfg.get("tau_neg", 1.2))
-        tau_delta = float(tri.get("tau_delta", 0.05))
+        tri_gate = config.get("tri_gate", {})
+        entropy_cfg = tri_gate.get("entropy", {})
+        cache_cfg = config.get("cache", {})
+        fusion_cfg = config.get("fusion", {})
 
-        cache_cfg = cfg.get("cache", {})
-        L_pos = int(cache_cfg.get("L_pos", 5))
-        L_neg = int(cache_cfg.get("L_neg", 5))
-        beta = float(cache_cfg.get("beta", 10.0))
-
-        fusion = cfg.get("fusion", {})
-        lambda_src = float(fusion.get("lambda_src", 1.0))
-        lambda_pos = float(fusion.get("lambda_pos", 1.0))
-        lambda_neg = float(fusion.get("lambda_neg", 1.0))
-
-        acc = run_online_tta(
-            test_loader,
+        print(f"\nRunning {dataset_name} with classes: {classnames}")
+        run_online_tta(
+            loader,
             clip_model,
             clip_weights,
-            proto_db,
+            prototype_database,
             head=head,
             window=args.window,
             proto_topk=args.proto_topk,
             cache_topk=args.cache_topk,
-            tau_H_pos=tau_H_pos,
-            tau_H_neg=tau_H_neg,
-            tau_delta=tau_delta,
-            L_pos=L_pos,
-            L_neg=L_neg,
-            beta=beta,
-            lambda_src=lambda_src,
-            lambda_pos=lambda_pos,
-            lambda_neg=lambda_neg,
-            default_subject=args.default_subject,
+            tau_entropy_positive=float(entropy_cfg.get("tau_pos", 0.5)),
+            tau_entropy_negative=float(entropy_cfg.get("tau_neg", 0.8)),
+            tau_prototype_margin=float(tri_gate.get("tau_delta", 0.05)),
+            positive_capacity=int(cache_cfg.get("L_pos", 5)),
+            negative_capacity=int(cache_cfg.get("L_neg", 4)),
+            cache_beta=float(cache_cfg.get("beta", 10.0)),
+            lambda_src=float(fusion_cfg.get("lambda_src", 1.0)),
+            lambda_pos=float(fusion_cfg.get("lambda_pos", 1.0)),
+            lambda_neg=float(fusion_cfg.get("lambda_neg", 1.0)),
             gates=args.gates,
             proto_missing=args.proto_missing,
             fusion_space=args.fusion_space,
-            use_proto_fusion=args.use_proto_fusion,
-            proto_gamma=args.proto_gamma,
+            weighting_strategy=args.weighting_strategy,
+            agreement_mode=args.agreement_mode,
+            attention_temperature=args.attention_temperature,
             save_metrics_path=args.save_metrics,
             save_metrics_txt=args.save_metrics_txt,
             model_stats=model_stats,
         )
-
-        print(f"---- Online TTA overall WAR: {acc:.2f}. ----\n")
 
 
 if __name__ == "__main__":
