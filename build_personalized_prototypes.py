@@ -1,464 +1,550 @@
-import os
-import math
+from __future__ import annotations
+
+import argparse
+import hashlib
 import json
+import math
 import random
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional, Sequence, Tuple
 
-import torch
 import numpy as np
+import torch
 from PIL import Image
+from sklearn.cluster import DBSCAN
+from sklearn.metrics import adjusted_rand_score
+from sklearn.neighbors import NearestNeighbors
 from tqdm import tqdm
 
-from sklearn.cluster import DBSCAN
-from sklearn.neighbors import NearestNeighbors
-from sklearn.metrics import adjusted_rand_score
+import clip
+from utils import (
+    get_config_file,
+    list_images,
+    load_clip_backbone_checkpoint,
+    natural_key,
+    resolve_dataset_root,
+)
 
-import open_clip
+
+def l2_normalize(x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    return x / x.norm(dim=-1, keepdim=True).clamp_min(eps)
 
 
-# -------------------------
-# Config / helpers
-# -------------------------
+def stable_seed(*parts: object, base: int = 0) -> int:
+    text = "|".join(str(part) for part in parts).encode("utf-8")
+    digest = hashlib.sha1(text).hexdigest()[:8]
+    return (int(digest, 16) + int(base)) % (2**31 - 1)
 
-CLASS2IDX = {"neutral": 0, "positive": 1}
 
-def l2n(x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
-    return x / (x.norm(dim=-1, keepdim=True) + eps)
+def safe_mean_var(features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    if features.ndim != 2 or features.shape[0] == 0:
+        raise ValueError(f"Expected non-empty [N,D] features, got {tuple(features.shape)}")
+    return features.mean(dim=0), features.var(dim=0, unbiased=False)
 
-def list_jpgs(folder: Path) -> List[Path]:
-    if not folder.exists():
-        return []
-    return sorted([p for p in folder.rglob("*.jpg")] + [p for p in folder.rglob("*.jpeg")] + [p for p in folder.rglob("*.png")])
 
-def parse_source_subject(video_folder_name: str) -> str:
-    # e.g. "081617_m_27-BL1-081" -> "081617_m_27"
-    return video_folder_name.split("-")[0]
+def shrink_variance(variance: torch.Tensor, lam: float) -> torch.Tensor:
+    if not 0.0 <= lam <= 1.0:
+        raise ValueError("shrink_lam must be in [0,1].")
+    return (1.0 - lam) * variance + lam * torch.ones_like(variance)
 
-def safe_mean_var(X: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    # X: [N, d]
-    mu = X.mean(dim=0)
-    var = X.var(dim=0, unbiased=False)
-    return mu, var
 
-def shrink_var(var: torch.Tensor, lam: float) -> torch.Tensor:
-    # σ^2 <- (1-λ)σ^2 + λ*1
-    return (1.0 - lam) * var + lam * torch.ones_like(var)
+def diagonal_frechet_distance(
+    mu_a: torch.Tensor,
+    var_a: torch.Tensor,
+    mu_b: torch.Tensor,
+    var_b: torch.Tensor,
+) -> float:
+    mean_term = (mu_a - mu_b).pow(2).sum()
+    cross = torch.sqrt((var_a * var_b).clamp_min(1e-12))
+    covariance_term = (var_a + var_b - 2.0 * cross).sum()
+    return float((mean_term + covariance_term).item())
 
-def diag_frechet_w2(mu1, var1, mu2, var2) -> float:
-    # diagonal Gaussian W2^2
-    # ||mu1 - mu2||^2 + sum(var1 + var2 - 2*sqrt(var1*var2))
-    dmu = (mu1 - mu2).pow(2).sum().item()
-    cross = torch.sqrt(torch.clamp(var1 * var2, min=1e-12))
-    dvar = (var1 + var2 - 2.0 * cross).sum().item()
-    return float(dmu + dvar)
 
-def compute_knn_distances(X: np.ndarray, k: int) -> np.ndarray:
-    # distance to k-th nearest neighbor for each point (k>=2)
-    nn = NearestNeighbors(n_neighbors=min(k, len(X)))
-    nn.fit(X)
-    dists, _ = nn.kneighbors(X, return_distance=True)
-    # dists[:,0] is 0 (self); take k-1 index if possible
-    idx = min(k - 1, dists.shape[1] - 1)
-    return dists[:, idx]
+@dataclass(frozen=True)
+class DBSCANSearch:
+    min_samples: Sequence[int]
+    quantiles: Sequence[float]
+    bootstraps: int = 6
+    bootstrap_fraction: float = 0.8
+    stability_weight: float = 0.5
+    max_noise_rate: float = 0.95
 
-def dbscan_score(labels: np.ndarray) -> Tuple[float, float, int]:
-    # validity: low noise + non-degenerate clusters
-    n = len(labels)
-    noise = (labels == -1).sum()
-    noise_rate = noise / max(n, 1)
-    clusters = sorted([c for c in set(labels.tolist()) if c != -1])
+
+def kth_neighbor_distances(features: np.ndarray, k: int) -> np.ndarray:
+    neighbors = min(max(2, int(k)), len(features))
+    model = NearestNeighbors(n_neighbors=neighbors, metric="euclidean").fit(features)
+    distances, _ = model.kneighbors(features)
+    return distances[:, min(neighbors - 1, k - 1)]
+
+
+def clustering_validity(labels: np.ndarray, max_noise_rate: float) -> Tuple[float, float, int]:
+    noise_rate = float(np.mean(labels == -1))
+    clusters = [label for label in np.unique(labels) if label != -1]
     num_clusters = len(clusters)
-
-    if num_clusters <= 0:
+    if num_clusters == 0 or noise_rate > max_noise_rate:
         return -1e9, noise_rate, num_clusters
+    # Rewards retained samples and multiple dense modes without favoring fragmentation too strongly.
+    score = (1.0 - noise_rate) * math.log1p(num_clusters)
+    return float(score), noise_rate, num_clusters
 
-    # simple validity term
-    validity = (1.0 - noise_rate) * math.log(num_clusters + 1.0)
-    return float(validity), float(noise_rate), int(num_clusters)
 
-def bootstrap_ari(X: np.ndarray, eps: float, min_samples: int, B: int, frac: float = 0.8, seed: int = 0) -> float:
-    # stability by ARI on intersections of random subsamples
-    rng = np.random.RandomState(seed)
-    n = len(X)
-    if n < max(min_samples + 1, 10):
+def bootstrap_stability(
+    features: np.ndarray,
+    eps: float,
+    min_samples: int,
+    bootstraps: int,
+    fraction: float,
+    seed: int,
+) -> float:
+    if bootstraps < 2 or len(features) < max(min_samples + 1, 10):
         return 0.0
 
-    runs = []
-    for b in range(B):
-        idx = rng.choice(n, size=max(2, int(frac * n)), replace=False)
-        Xb = X[idx]
-        lab = DBSCAN(eps=eps, min_samples=min_samples, metric="euclidean").fit_predict(Xb)
-        runs.append((idx, lab))
+    rng = np.random.RandomState(seed)
+    runs: List[Tuple[np.ndarray, np.ndarray]] = []
+    sample_size = max(2, int(round(fraction * len(features))))
+    for _ in range(bootstraps):
+        indices = np.sort(rng.choice(len(features), size=sample_size, replace=False))
+        labels = DBSCAN(eps=eps, min_samples=min_samples).fit_predict(features[indices])
+        runs.append((indices, labels))
 
-    aris = []
+    values: List[float] = []
     for i in range(len(runs)):
         for j in range(i + 1, len(runs)):
-            idx_i, lab_i = runs[i]
-            idx_j, lab_j = runs[j]
-            inter, pos_i, pos_j = np.intersect1d(idx_i, idx_j, return_indices=True)
-            if len(inter) < 5:
-                continue
-            aris.append(adjusted_rand_score(lab_i[pos_i], lab_j[pos_j]))
+            idx_i, labels_i = runs[i]
+            idx_j, labels_j = runs[j]
+            overlap, pos_i, pos_j = np.intersect1d(idx_i, idx_j, return_indices=True)
+            if len(overlap) >= 5:
+                values.append(adjusted_rand_score(labels_i[pos_i], labels_j[pos_j]))
+    return float(np.mean(values)) if values else 0.0
 
-    if len(aris) == 0:
-        return 0.0
-    return float(np.mean(aris))
 
-def cluster_medoids(X: torch.Tensor, labels: np.ndarray) -> torch.Tensor:
-    # X: [N,d] torch, labels: [N] np
-    medoids = []
-    clusters = sorted([c for c in set(labels.tolist()) if c != -1])
-    Xnp = X.cpu().numpy()
+def select_dbscan_parameters(
+    features: torch.Tensor,
+    search: DBSCANSearch,
+    seed: int,
+) -> Tuple[Optional[float], Optional[int], Dict[str, float]]:
+    normalized = l2_normalize(features.float()).cpu().numpy()
+    best_score = -float("inf")
+    best: Tuple[Optional[float], Optional[int], Dict[str, float]] = (None, None, {"fallback": 1.0})
 
-    for c in clusters:
-        idx = np.where(labels == c)[0]
-        Xc = Xnp[idx]
-        mu = Xc.mean(axis=0, keepdims=True)  # [1,d]
-        # medoid: closest point to centroid in L2
-        d = ((Xc - mu) ** 2).sum(axis=1)
-        med = idx[int(np.argmin(d))]
-        medoids.append(X[med].unsqueeze(0))
-
-    if len(medoids) == 0:
-        return torch.empty((0, X.shape[1]), dtype=X.dtype, device=X.device)
-    return torch.cat(medoids, dim=0)
-
-@dataclass
-class DBSCANSearch:
-    min_samples_list: List[int]
-    quantiles: List[float]
-    B: int
-    alpha: float  # weight for stability
-
-def select_dbscan_params(X: torch.Tensor, search: DBSCANSearch, seed: int = 0) -> Tuple[float, int, Dict]:
-    """
-    Choose (eps, min_samples) by:
-      score = validity + alpha * stability
-    eps candidates from quantiles of m-NN distances.
-    """
-    X = l2n(X).float()
-    Xnp = X.cpu().numpy()
-
-    best = (-1e18, None, None, None)  # score, eps, m, meta
-    for m in search.min_samples_list:
-        if len(Xnp) < max(m + 1, 10):
+    for min_samples in search.min_samples:
+        if len(normalized) < max(min_samples + 1, 10):
             continue
-        kth = compute_knn_distances(Xnp, k=m)
-        eps_candidates = [float(np.quantile(kth, q)) for q in search.quantiles]
-        # remove duplicates / zeros
-        eps_candidates = sorted(set([e for e in eps_candidates if e > 1e-6]))
-
-        for eps in eps_candidates:
-            labels = DBSCAN(eps=eps, min_samples=m, metric="euclidean").fit_predict(Xnp)
-            validity, noise_rate, num_clusters = dbscan_score(labels)
+        kth = kth_neighbor_distances(normalized, min_samples)
+        candidates = sorted({float(np.quantile(kth, q)) for q in search.quantiles if 0.0 < q < 1.0})
+        for eps in candidates:
+            if eps <= 1e-8:
+                continue
+            labels = DBSCAN(eps=eps, min_samples=min_samples).fit_predict(normalized)
+            validity, noise_rate, num_clusters = clustering_validity(labels, search.max_noise_rate)
             if validity < -1e8:
                 continue
-            stability = bootstrap_ari(Xnp, eps=eps, min_samples=m, B=search.B, seed=seed)
-            score = validity + search.alpha * stability
-
-            if score > best[0]:
-                best = (score, eps, m, dict(validity=validity, stability=stability,
-                                            noise_rate=noise_rate, num_clusters=num_clusters))
-    if best[1] is None:
-        # fallback: one "cluster" => single medoid by mean
-        return 0.5, 5, dict(fallback=True)
-    return float(best[1]), int(best[2]), best[3]
-
-
-# -------------------------
-# CLIP encoder
-# -------------------------
-
-@torch.no_grad()
-def build_clip_encoder(backbone: str = "ViT-B-32", pretrained: str = "openai", device: str = "cuda"):
-    model, _, preprocess = open_clip.create_model_and_transforms(backbone, pretrained=pretrained)
-    model = model.to(device).eval()
-    return model, preprocess
-
-@torch.no_grad()
-def encode_images(model, preprocess, paths: List[Path], device: str, batch_size: int = 64) -> torch.Tensor:
-    feats = []
-    for i in range(0, len(paths), batch_size):
-        batch = paths[i:i+batch_size]
-        imgs = []
-        for p in batch:
-            img = Image.open(p).convert("RGB")
-            imgs.append(preprocess(img))
-        x = torch.stack(imgs, dim=0).to(device)
-        f = model.encode_image(x)
-        f = l2n(f).cpu()
-        feats.append(f)
-    return torch.cat(feats, dim=0) if feats else torch.empty((0, model.visual.output_dim), dtype=torch.float32)
+            stability = bootstrap_stability(
+                normalized,
+                eps,
+                min_samples,
+                search.bootstraps,
+                search.bootstrap_fraction,
+                seed,
+            )
+            score = validity + search.stability_weight * stability
+            if score > best_score:
+                best_score = score
+                best = (
+                    eps,
+                    min_samples,
+                    {
+                        "fallback": 0.0,
+                        "score": float(score),
+                        "validity": float(validity),
+                        "stability": float(stability),
+                        "noise_rate": float(noise_rate),
+                        "num_clusters": float(num_clusters),
+                    },
+                )
+    return best
 
 
-# -------------------------
-# Main pipeline
-# -------------------------
+def closest_to_mean(features: torch.Tensor) -> torch.Tensor:
+    mean = features.mean(dim=0, keepdim=True)
+    index = int(((features - mean) ** 2).sum(dim=1).argmin().item())
+    return features[index:index + 1]
 
-def collect_source_index(source_root: Path) -> Dict[str, Dict[str, List[Path]]]:
-    """
-    Returns: index[subject_id][class_name] = list(paths)
-    Uses both train and validation under source_root.
-    """
-    idx: Dict[str, Dict[str, List[Path]]] = {}
 
-    for split in ["train", "validation"]:
-        for cls in CLASS2IDX.keys():
-            cls_dir = source_root / split / cls
-            if not cls_dir.exists():
+def cluster_medoids(features: torch.Tensor, labels: np.ndarray) -> torch.Tensor:
+    medoids: List[torch.Tensor] = []
+    numpy_features = features.cpu().numpy()
+    for label in sorted(label for label in np.unique(labels) if label != -1):
+        indices = np.where(labels == label)[0]
+        cluster = numpy_features[indices]
+        center = cluster.mean(axis=0, keepdims=True)
+        local_index = int(np.argmin(((cluster - center) ** 2).sum(axis=1)))
+        medoids.append(features[int(indices[local_index])].unsqueeze(0))
+    return torch.cat(medoids, dim=0) if medoids else closest_to_mean(features)
+
+
+def parse_source_subject(video_name: str, pattern: str) -> str:
+    match = re.search(pattern, video_name)
+    if match is None:
+        raise ValueError(
+            f"Cannot extract a source subject from video folder '{video_name}' with regex '{pattern}'."
+        )
+    return str(match.group(1) if match.groups() else match.group(0))
+
+
+def collect_source_index(dataset_root: Path, dataset_cfg: Dict) -> Dict[str, Dict[int, List[Path]]]:
+    class_folders = list(dataset_cfg["class_folders"])
+    splits = list(dataset_cfg.get("source_splits", ["train", "validation"]))
+    subject_regex = str(dataset_cfg.get("source_subject_regex", r"^([^-]+)"))
+    index: Dict[str, Dict[int, List[Path]]] = {}
+
+    for split in splits:
+        for class_index, class_folder in enumerate(class_folders):
+            class_root = dataset_root / split / class_folder
+            if not class_root.exists():
                 continue
+            for image_path in list_images(class_root):
+                relative = image_path.relative_to(class_root)
+                video_name = relative.parts[0] if relative.parts else image_path.parent.name
+                subject_id = parse_source_subject(video_name, subject_regex)
+                index.setdefault(subject_id, {}).setdefault(class_index, []).append(image_path)
 
-            # inside: video folders
-            for vid_dir in cls_dir.iterdir():
-                if not vid_dir.is_dir():
-                    continue
-                subj = parse_source_subject(vid_dir.name)
-                idx.setdefault(subj, {}).setdefault(cls, [])
-                idx[subj][cls].extend(list_jpgs(vid_dir))
+    if not index:
+        expected = dataset_root / splits[0] / class_folders[0] / "<video>" / "<frame>.jpg"
+        raise RuntimeError(f"No source frames found. Expected a layout similar to: {expected}")
+    return index
 
-    return idx
 
-def collect_target_index(target_root: Path) -> Dict[str, Dict[str, List[Path]]]:
-    """
-    target_root = BioVid_Video
-    inside: 1..10
-    Returns: index[target_id][class_name] = list(paths)
-    """
-    idx: Dict[str, Dict[str, List[Path]]] = {}
-    for subj_dir in sorted([p for p in target_root.iterdir() if p.is_dir()]):
-        t_id = subj_dir.name  # "1", "2", ...
-        idx.setdefault(t_id, {})
-        for cls in CLASS2IDX.keys():
-            cls_dir = subj_dir / cls
-            if not cls_dir.exists():
-                continue
-            idx[t_id].setdefault(cls, [])
-            idx[t_id][cls].extend(list_jpgs(cls_dir))
-    return idx
+def collect_target_index(dataset_root: Path, dataset_cfg: Dict) -> Dict[str, List[Path]]:
+    target_subdir = str(dataset_cfg.get("target_subdir", "")).strip()
+    target_root = dataset_root / target_subdir if target_subdir else dataset_root
+    source_splits = set(dataset_cfg.get("source_splits", ["train", "validation"]))
+    source_splits.update(dataset_cfg.get("exclude_target_dirs", []))
+    pattern = re.compile(str(dataset_cfg.get("target_subject_regex", r".+")))
 
-def subsample(paths: List[Path], max_n: int, seed: int) -> List[Path]:
-    if max_n <= 0 or len(paths) <= max_n:
-        return paths
+    index: Dict[str, List[Path]] = {}
+    subject_dirs = [
+        path for path in target_root.iterdir()
+        if path.is_dir()
+        and path.name not in source_splits
+        and not path.name.startswith(".")
+        and pattern.fullmatch(path.name)
+    ]
+    for subject_dir in sorted(subject_dirs, key=lambda p: natural_key(p.name)):
+        paths = list_images(subject_dir)
+        if paths:
+            index[subject_dir.name] = paths
+    if not index:
+        raise RuntimeError(f"No target-subject frames found under: {target_root}")
+    return index
+
+
+def subsample(paths: Sequence[Path], max_count: int, seed: int) -> List[Path]:
+    values = list(paths)
+    if max_count <= 0 or len(values) <= max_count:
+        return values
     rng = random.Random(seed)
-    paths2 = paths.copy()
-    rng.shuffle(paths2)
-    return paths2[:max_n]
+    rng.shuffle(values)
+    return sorted(values[:max_count], key=lambda p: natural_key(p.as_posix()))
 
-def build_source_prototypes(
-    model, preprocess,
-    source_index: Dict[str, Dict[str, List[Path]]],
-    device: str,
+
+@torch.no_grad()
+def encode_images(
+    model,
+    preprocess,
+    paths: Sequence[Path],
+    device: torch.device,
+    batch_size: int,
+) -> torch.Tensor:
+    batches: List[torch.Tensor] = []
+    for start in range(0, len(paths), batch_size):
+        images: List[torch.Tensor] = []
+        for path in paths[start:start + batch_size]:
+            with Image.open(path) as image:
+                images.append(preprocess(image.convert("RGB")))
+        batch = torch.stack(images, dim=0).to(device, non_blocking=True)
+        features = l2_normalize(model.encode_image(batch).float()).cpu()
+        batches.append(features)
+    output_dim = int(getattr(model.visual, "output_dim", 512))
+    return torch.cat(batches, dim=0) if batches else torch.empty((0, output_dim), dtype=torch.float32)
+
+
+def build_source_prototypes_and_statistics(
+    model,
+    preprocess,
+    source_index: Dict[str, Dict[int, List[Path]]],
+    num_classes: int,
+    device: torch.device,
     batch_size: int,
     max_frames_per_subject_class: int,
     search: DBSCANSearch,
-    seed: int = 0
-) -> Dict[str, Dict[int, torch.Tensor]]:
-    """
-    Returns: M[s][c_idx] = Tensor[R, d] (medoids)
-    """
-    out: Dict[str, Dict[int, torch.Tensor]] = {}
-    subjects = sorted(source_index.keys())
+    shrink_lam: float,
+    seed: int,
+):
+    prototypes: Dict[str, Dict[int, torch.Tensor]] = {}
+    statistics: Dict[str, Dict[str, torch.Tensor]] = {}
+    clustering_meta: Dict[str, Dict[int, Dict[str, float]]] = {}
+    output_dim = int(getattr(model.visual, "output_dim", 512))
 
-    for s in tqdm(subjects, desc="Source prototypes (DBSCAN medoids)"):
-        out[s] = {}
-        for cls_name, c_idx in CLASS2IDX.items():
-            paths = source_index.get(s, {}).get(cls_name, [])
-            paths = subsample(paths, max_frames_per_subject_class, seed=seed + hash((s, cls_name)) % 10000)
-            if len(paths) == 0:
-                out[s][c_idx] = torch.empty((0, model.visual.output_dim), dtype=torch.float32)
+    for subject_id in tqdm(sorted(source_index, key=natural_key), desc="Source subjects"):
+        prototypes[subject_id] = {}
+        clustering_meta[subject_id] = {}
+        all_subject_features: List[torch.Tensor] = []
+
+        for class_index in range(num_classes):
+            paths = subsample(
+                source_index.get(subject_id, {}).get(class_index, []),
+                max_frames_per_subject_class,
+                stable_seed(subject_id, class_index, base=seed),
+            )
+            if not paths:
+                prototypes[subject_id][class_index] = torch.empty((0, output_dim), dtype=torch.float32)
+                clustering_meta[subject_id][class_index] = {"empty": 1.0}
                 continue
 
-            F = encode_images(model, preprocess, paths, device=device, batch_size=batch_size)
-            F = l2n(F).float()
+            features = encode_images(model, preprocess, paths, device, batch_size)
+            features = l2_normalize(features.float())
+            all_subject_features.append(features)
 
-            eps, m, meta = select_dbscan_params(F, search=search, seed=seed)
-            if meta.get("fallback", False) or len(F) < 10:
-                # fallback: single prototype = closest to mean
-                mu = F.mean(dim=0, keepdim=True)
-                d = ((F - mu) ** 2).sum(dim=1)
-                med = int(torch.argmin(d).item())
-                out[s][c_idx] = F[med:med+1]
+            eps, min_samples, meta = select_dbscan_parameters(
+                features,
+                search,
+                stable_seed(subject_id, class_index, "dbscan", base=seed),
+            )
+            if eps is None or min_samples is None or features.shape[0] < 10:
+                class_prototypes = closest_to_mean(features)
+                meta = {**meta, "fallback": 1.0}
             else:
-                labels = DBSCAN(eps=eps, min_samples=m, metric="euclidean").fit_predict(F.numpy())
-                out[s][c_idx] = cluster_medoids(F, labels)
+                labels = DBSCAN(eps=eps, min_samples=min_samples).fit_predict(features.numpy())
+                class_prototypes = cluster_medoids(features, labels)
+                meta = {**meta, "eps": float(eps), "min_samples": float(min_samples)}
 
-    return out
+            prototypes[subject_id][class_index] = l2_normalize(class_prototypes).cpu()
+            clustering_meta[subject_id][class_index] = meta
 
-def build_personalized_cache(
-    source_protos: Dict[str, Dict[int, torch.Tensor]],
-    target_index: Dict[str, Dict[str, List[Path]]],
-    model, preprocess,
-    device: str,
+        if not all_subject_features:
+            raise RuntimeError(f"Source subject '{subject_id}' has no usable frames.")
+        subject_features = torch.cat(all_subject_features, dim=0)
+        mean, variance = safe_mean_var(subject_features)
+        statistics[subject_id] = {
+            "mean": mean.cpu(),
+            "variance": shrink_variance(variance, shrink_lam).cpu(),
+            "num_features": torch.tensor(subject_features.shape[0]),
+        }
+
+    return prototypes, statistics, clustering_meta
+
+
+def build_personalized_caches(
+    source_prototypes: Dict[str, Dict[int, torch.Tensor]],
+    source_statistics: Dict[str, Dict[str, torch.Tensor]],
+    target_index: Dict[str, List[Path]],
+    model,
+    preprocess,
+    num_classes: int,
+    device: torch.device,
     batch_size: int,
-    anchor_class: str,
     top_m: int,
     shrink_lam: float,
-    cap_K: int,
-    seed: int = 0,
-    max_calib_frames: int = 2000,
-) -> Tuple[Dict[str, Dict[int, torch.Tensor]], Dict]:
-    """
-    Returns:
-      personalized[target_id][c_idx] = Tensor[?, d]
-      meta with selected sources per target
-    """
-    # (I) compute source anchor stats from anchor prototypes
-    src_stats = {}
-    a_idx = CLASS2IDX[anchor_class]
-    for s, per_cls in source_protos.items():
-        Zs = per_cls.get(a_idx, torch.empty((0, 1)))
-        if Zs.numel() == 0 or Zs.shape[0] == 0:
-            continue
-        mu, var = safe_mean_var(Zs.float())
-        var = shrink_var(var, shrink_lam)
-        src_stats[s] = (mu, var)
-
+    cap_per_class: int,
+    max_target_frames: int,
+    seed: int,
+):
     personalized: Dict[str, Dict[int, torch.Tensor]] = {}
-    meta = {"selected_sources": {}}
+    target_statistics: Dict[str, Dict[str, torch.Tensor]] = {}
+    selected_sources: Dict[str, List[str]] = {}
+    source_distances: Dict[str, List[Tuple[str, float]]] = {}
+    output_dim = int(getattr(model.visual, "output_dim", 512))
 
-    # (II) per target: compute target anchor stats from neutral frames, pick top-m sources
-    for t_id in tqdm(sorted(target_index.keys()), desc="Personalized cache per target"):
-        paths_anchor = target_index[t_id].get(anchor_class, [])
-        paths_anchor = subsample(paths_anchor, max_calib_frames, seed=seed + int(t_id) if t_id.isdigit() else seed)
-        if len(paths_anchor) == 0:
-            raise RuntimeError(f"Target {t_id} has no anchor frames under class '{anchor_class}'")
+    for target_id in tqdm(sorted(target_index, key=natural_key), desc="Target personalization"):
+        target_paths = subsample(
+            target_index[target_id],
+            max_target_frames,
+            stable_seed(target_id, "target", base=seed),
+        )
+        target_features = encode_images(model, preprocess, target_paths, device, batch_size)
+        target_features = l2_normalize(target_features.float())
+        mean_t, variance_t = safe_mean_var(target_features)
+        variance_t = shrink_variance(variance_t, shrink_lam)
+        target_statistics[target_id] = {
+            "mean": mean_t.cpu(),
+            "variance": variance_t.cpu(),
+            "num_features": torch.tensor(target_features.shape[0]),
+        }
 
-        Zt = encode_images(model, preprocess, paths_anchor, device=device, batch_size=batch_size)
-        Zt = l2n(Zt).float()
-        mu_t, var_t = safe_mean_var(Zt)
-        var_t = shrink_var(var_t, shrink_lam)
+        ranked: List[Tuple[float, str]] = []
+        for source_id, stats in source_statistics.items():
+            distance = diagonal_frechet_distance(
+                mean_t,
+                variance_t,
+                stats["mean"].float(),
+                stats["variance"].float(),
+            )
+            ranked.append((distance, source_id))
+        ranked.sort(key=lambda pair: pair[0])
+        selected = [source_id for _, source_id in ranked[:max(1, top_m)]]
+        selected_sources[target_id] = selected
+        source_distances[target_id] = [(source_id, float(distance)) for distance, source_id in ranked]
 
-        # rank sources
-        dists = []
-        for s, (mu_s, var_s) in src_stats.items():
-            d = diag_frechet_w2(mu_t, var_t, mu_s, var_s)
-            dists.append((d, s))
-        dists.sort(key=lambda x: x[0])
-        selected = [s for _, s in dists[:top_m]]
-        meta["selected_sources"][t_id] = selected
-
-        # build P^{pers}_{t,c} by union of medoids from selected sources
-        personalized[t_id] = {}
-        for cls_name, c_idx in CLASS2IDX.items():
-            pieces = []
-            for s in selected:
-                Z = source_protos.get(s, {}).get(c_idx, None)
-                if Z is None or Z.shape[0] == 0:
-                    continue
-                pieces.append(Z)
-            if len(pieces) == 0:
-                personalized[t_id][c_idx] = torch.empty((0, model.visual.output_dim), dtype=torch.float32)
+        personalized[target_id] = {}
+        normalized_target_mean = l2_normalize(mean_t.unsqueeze(0)).squeeze(0)
+        for class_index in range(num_classes):
+            pieces = [
+                source_prototypes[source_id][class_index]
+                for source_id in selected
+                if class_index in source_prototypes[source_id]
+                and source_prototypes[source_id][class_index].numel() > 0
+            ]
+            if not pieces:
+                personalized[target_id][class_index] = torch.empty((0, output_dim), dtype=torch.float32)
                 continue
-            P = l2n(torch.cat(pieces, dim=0).float())
+            prototypes = l2_normalize(torch.cat(pieces, dim=0).float())
+            if cap_per_class > 0 and prototypes.shape[0] > cap_per_class:
+                similarities = prototypes @ normalized_target_mean
+                keep = torch.topk(similarities, k=cap_per_class, largest=True).indices
+                prototypes = prototypes[keep]
+            personalized[target_id][class_index] = prototypes.cpu()
 
-            # optional per-class cap K: keep K prototypes closest to target anchor mean
-            if cap_K > 0 and P.shape[0] > cap_K:
-                sims = (P @ l2n(mu_t).unsqueeze(-1)).squeeze(-1)  # cosine since both l2
-                topk = torch.topk(sims, k=cap_K, largest=True).indices
-                P = P[topk]
-
-            personalized[t_id][c_idx] = P.cpu()
-
+    meta = {
+        "selected_sources": selected_sources,
+        "source_distances": source_distances,
+        "target_statistics": target_statistics,
+    }
     return personalized, meta
 
 
-def main():
-    import argparse
-    parser = argparse.ArgumentParser()
+def parse_number_list(text: str, cast):
+    return [cast(value.strip()) for value in text.split(",") if value.strip()]
 
-    # paths
-    parser.add_argument("--source-root", type=str, required=True, help="Root containing train/ and validation/")
-    parser.add_argument("--target-root", type=str, required=True, help="BioVid_Video folder containing 1..10")
 
-    # clip
-    parser.add_argument("--backbone", type=str, default="ViT-B-32")
-    parser.add_argument("--pretrained", type=str, default="openai")
-    parser.add_argument("--device", type=str, default="cuda")
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Build TTA-CaP personalized static caches.")
+    parser.add_argument("--config", required=True, help="Config directory or dataset YAML file.")
+    parser.add_argument("--dataset", required=True, help="Dataset name, e.g. biovid or stressid.")
+    parser.add_argument("--source-root", required=True, help="Parent data root or exact dataset root.")
+    parser.add_argument("--target-root", default=None, help="Optional separate parent/exact target root.")
+    parser.add_argument("--out-dir", required=True)
+    parser.add_argument("--backbone", default="ViT-B/32", choices=["RN50", "ViT-B/16", "ViT-B/32"])
+    parser.add_argument("--ft-clip-path", default=None, help="Source-trained CLIP checkpoint used by online TTA.")
+    parser.add_argument("--device", default="cuda")
     parser.add_argument("--batch-size", type=int, default=64)
-
-    # prototype extraction
-    parser.add_argument("--max-frames-per-subject-class", type=int, default=3000)
-    parser.add_argument("--min-samples", type=str, default="5,10,15")
-    parser.add_argument("--quantiles", type=str, default="0.5,0.6,0.7,0.8,0.9")
-    parser.add_argument("--bootstraps", type=int, default=6)
-    parser.add_argument("--alpha", type=float, default=0.5)
-
-    # personalization
-    parser.add_argument("--anchor-class", type=str, default="neutral")
-    parser.add_argument("--top-m", type=int, default=5)
+    parser.add_argument("--top-m", type=int, default=3)
+    parser.add_argument("--cap-per-class", type=int, default=0, help="0 keeps all selected prototypes.")
+    parser.add_argument("--max-source-frames-per-subject-class", type=int, default=0, help="0 uses all source frames in each subject-class subset.")
+    parser.add_argument("--max-target-frames", type=int, default=0, help="0 uses all unlabeled target frames.")
     parser.add_argument("--shrink-lam", type=float, default=0.05)
-    parser.add_argument("--cap-K", type=int, default=0, help="0 disables cap; else keep K prototypes per class")
-    parser.add_argument("--max-calib-frames", type=int, default=2000)
-
-    # output
-    parser.add_argument("--out-dir", type=str, default="./proto_out")
+    parser.add_argument("--min-samples", default="5,10,15")
+    parser.add_argument("--eps-quantiles", default="0.5,0.6,0.7,0.8,0.9")
+    parser.add_argument("--bootstraps", type=int, default=6)
+    parser.add_argument("--bootstrap-fraction", type=float, default=0.8)
+    parser.add_argument("--stability-weight", type=float, default=0.5)
+    parser.add_argument("--max-noise-rate", type=float, default=0.95)
     parser.add_argument("--seed", type=int, default=0)
-
     args = parser.parse_args()
 
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
+    config = get_config_file(args.config, args.dataset)
+    dataset_cfg = config.get("dataset", {})
+    class_folders = list(dataset_cfg.get("class_folders", []))
+    class_names = list(dataset_cfg.get("class_names", class_folders))
+    if not class_folders or len(class_folders) != len(class_names):
+        raise ValueError("Config must define equal-length dataset.class_folders and dataset.class_names.")
 
-    model, preprocess = build_clip_encoder(args.backbone, args.pretrained, args.device)
+    source_root = resolve_dataset_root(args.source_root, dataset_cfg)
+    target_root = resolve_dataset_root(args.target_root or args.source_root, dataset_cfg)
 
-    # 1) index source + target
-    source_index = collect_source_index(Path(args.source_root))
-    target_index = collect_target_index(Path(args.target_root))
+    model, preprocess = clip.load(args.backbone, device=str(device), jit=False)
+    missing, unexpected = load_clip_backbone_checkpoint(model, args.ft_clip_path)
+    if args.ft_clip_path:
+        print(f"Loaded source CLIP checkpoint: {args.ft_clip_path}")
+        print(f"  missing={len(missing)}, unexpected={len(unexpected)}")
+    model.eval()
 
-    print(f"[source] subjects: {len(source_index)}")
-    print(f"[target] subjects: {len(target_index)}")
+    source_index = collect_source_index(source_root, dataset_cfg)
+    target_index = collect_target_index(target_root, dataset_cfg)
+    print(f"Source subjects: {len(source_index)}")
+    print(f"Target subjects: {len(target_index)}")
 
     search = DBSCANSearch(
-        min_samples_list=[int(x) for x in args.min_samples.split(",")],
-        quantiles=[float(x) for x in args.quantiles.split(",")],
-        B=args.bootstraps,
-        alpha=args.alpha
+        min_samples=parse_number_list(args.min_samples, int),
+        quantiles=parse_number_list(args.eps_quantiles, float),
+        bootstraps=args.bootstraps,
+        bootstrap_fraction=args.bootstrap_fraction,
+        stability_weight=args.stability_weight,
+        max_noise_rate=args.max_noise_rate,
     )
 
-    # 2) build source prototypes M_{s,c}
-    source_protos = build_source_prototypes(
-        model, preprocess,
+    source_prototypes, source_statistics, clustering_meta = build_source_prototypes_and_statistics(
+        model=model,
+        preprocess=preprocess,
         source_index=source_index,
-        device=args.device,
+        num_classes=len(class_names),
+        device=device,
         batch_size=args.batch_size,
-        max_frames_per_subject_class=args.max_frames_per_subject_class,
+        max_frames_per_subject_class=args.max_source_frames_per_subject_class,
         search=search,
-        seed=args.seed
+        shrink_lam=args.shrink_lam,
+        seed=args.seed,
     )
 
-    torch.save(source_protos, out_dir / "source_prototypes.pt")
-    print(f"Saved: {out_dir / 'source_prototypes.pt'}")
-
-    # 3) build personalized cache P^{pers}_{t,c}
-    personalized, meta = build_personalized_cache(
-        source_protos=source_protos,
+    personalized, personalization_meta = build_personalized_caches(
+        source_prototypes=source_prototypes,
+        source_statistics=source_statistics,
         target_index=target_index,
         model=model,
         preprocess=preprocess,
-        device=args.device,
+        num_classes=len(class_names),
+        device=device,
         batch_size=args.batch_size,
-        anchor_class=args.anchor_class,
         top_m=args.top_m,
         shrink_lam=args.shrink_lam,
-        cap_K=args.cap_K,
+        cap_per_class=args.cap_per_class,
+        max_target_frames=args.max_target_frames,
         seed=args.seed,
-        max_calib_frames=args.max_calib_frames,
     )
 
-    payload = {
-        "personalized": personalized,
-        "class2idx": CLASS2IDX,
-        "meta": meta,
-        "cfg": vars(args),
+    output_dir = Path(args.out_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "source_prototypes": source_prototypes,
+            "source_statistics": source_statistics,
+            "clustering_meta": clustering_meta,
+            "class_folders": class_folders,
+            "class_names": class_names,
+            "config": vars(args),
+        },
+        output_dir / "source_prototypes.pt",
+    )
+    torch.save(
+        {
+            "personalized": personalized,
+            "class_folders": class_folders,
+            "class_names": class_names,
+            "meta": personalization_meta,
+            "config": vars(args),
+        },
+        output_dir / "personalized_prototypes.pt",
+    )
+
+    summary = {
+        "dataset": args.dataset,
+        "source_subjects": len(source_index),
+        "target_subjects": len(target_index),
+        "top_m": args.top_m,
+        "selected_sources": personalization_meta["selected_sources"],
     }
-    torch.save(payload, out_dir / "personalized_prototypes.pt")
-    print(f"Saved: {out_dir / 'personalized_prototypes.pt'}")
+    with (output_dir / "cache_summary.json").open("w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2)
+
+    print(f"Saved source cache data to: {output_dir / 'source_prototypes.pt'}")
+    print(f"Saved personalized caches to: {output_dir / 'personalized_prototypes.pt'}")
 
 
 if __name__ == "__main__":
