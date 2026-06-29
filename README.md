@@ -1,9 +1,5 @@
-# Test-Time Adaptation via Cache Personalization for Facial Expression Recognition in Videos (ECCV2026).
+# Test-Time Adaptation via Cache Personalization for Facial Expression Recognition in Videos.
 
-<sup>1</sup> LIVIA, Dept. of Systems Engineering, ÉTS, Montreal, Canada
-<br/>
-<sup>2</sup> LIVIA, Dept. of Software and IT Engineering, ÉTS, Montreal, Canada
-<br/>
 
 <p align="center"><img src="assets/Motivation_WACV.png" alt="motivation" width="600">
 <p align="center"><img src="assets/Main_WACV.png" alt="main" width="600">
